@@ -19,6 +19,20 @@ for col,label,val in zip(st.columns(6),["Closed","Open","Win rate","Net P/L","Pr
  [m["closed"],m["open"],f'{m["win_rate"]:.1f}%',f'₹{m["net"]:,.0f}',f'{m["pf"]:.2f}' if m["pf"]!=float("inf") else "∞",f'₹{m["dd"]:,.0f}']): col.metric(label,val)
 st.info(f'Last scan: {e.last_run()} • Status: {e.last_status()}')
 o,c,s=e.tables()
-st.subheader("🟢 Open positions");st.dataframe(o,use_container_width=True,hide_index=True) if not o.empty else st.info("No open positions.")
-st.subheader("📕 Closed trades");st.dataframe(c,use_container_width=True,hide_index=True) if not c.empty else st.info("No closed trades yet.")
-st.subheader("🔎 Recent qualifying signals");st.dataframe(s,use_container_width=True,hide_index=True) if not s.empty else st.info("No qualifying signals.")
+st.subheader("🟢 Open positions")
+if o.empty:
+    st.info("No open positions.")
+else:
+    st.dataframe(o, use_container_width=True, hide_index=True)
+
+st.subheader("📕 Closed trades")
+if c.empty:
+    st.info("No closed trades yet.")
+else:
+    st.dataframe(c, use_container_width=True, hide_index=True)
+
+st.subheader("🔎 Recent qualifying signals")
+if s.empty:
+    st.info("No qualifying signals.")
+else:
+    st.dataframe(s, use_container_width=True, hide_index=True)
