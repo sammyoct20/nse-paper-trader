@@ -1,30 +1,52 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import yfinance as yf
 
 class PaperEngine:
 
     def __init__(self):
-        # No external client for now
         pass
 
     def scan_market(self):
-        """
-        Dummy scanner (replace later with real logic)
-        """
-        print("Scanning market...")
+        print("Scanning market (Yahoo Finance)...")
 
-        # fake signals
-        signals = [
-            {"symbol": "RELIANCE", "price": 2900},
-            {"symbol": "TCS", "price": 3500}
+        # NIFTY 50 sample (you can expand later)
+        symbols = [
+            "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS",
+            "ICICIBANK.NS", "LT.NS", "SBIN.NS", "ITC.NS"
         ]
+
+        signals = []
+
+        for sym in symbols:
+            try:
+                df = yf.download(sym, period="5d", interval="5m", progress=False)
+
+                if df.empty:
+                    continue
+
+                # Simple strategy: price breakout + volume spike
+                last = df.iloc[-1]
+                prev = df.iloc[-2]
+
+                price = last["Close"]
+                prev_price = prev["Close"]
+
+                volume = last["Volume"]
+                avg_volume = df["Volume"].mean()
+
+                # Condition (basic but real)
+                if price > prev_price and volume > 1.5 * avg_volume:
+                    signals.append({
+                        "symbol": sym,
+                        "price": round(price, 2),
+                        "volume": int(volume)
+                    })
+
+            except Exception as e:
+                print(f"Error fetching {sym}: {e}")
 
         return signals
 
     def save(self, signals):
-        """
-        Dummy save (replace with DB later)
-        """
         print(f"Saving {len(signals)} signals...")
 
     def run_once(self):
