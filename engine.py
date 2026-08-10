@@ -9,14 +9,11 @@ from datetime import datetime
 class PaperEngine:
 
     def __init__(self):
-        print("=== ENGINE INIT ===")
-
         db_url = os.getenv("DATABASE_URL")
         if not db_url:
             raise Exception("DATABASE_URL not set")
 
         self.conn = psycopg2.connect(db_url)
-
         self.create_tables()
 
         self.capital = 100000
@@ -59,7 +56,7 @@ class PaperEngine:
 
         for sym in symbols:
             try:
-                time.sleep(1)   # 🔥 prevents Yahoo rate limit
+                time.sleep(1)  # prevent rate limit
 
                 df = yf.download(sym, period="5d", interval="15m", progress=False)
 
@@ -67,14 +64,12 @@ class PaperEngine:
                     continue
 
                 close = float(df["Close"].iloc[-1])
-                ema20 = df["Close"].ewm(span=20).mean().iloc[-1]
 
-                # 🔧 TEMP: force signals (remove later)
-                if True:
-                    signals.append({
-                        "symbol": sym,
-                        "price": close
-                    })
+                # 🔴 FORCE SIGNALS (for testing)
+                signals.append({
+                    "symbol": sym,
+                    "price": close
+                })
 
             except Exception as e:
                 print(f"Error {sym}: {e}")
@@ -115,7 +110,6 @@ class PaperEngine:
 
         for t in trades:
 
-            # prevent duplicate trades
             cur.execute("""
             SELECT COUNT(*) FROM trades
             WHERE symbol=%s AND status='OPEN'
@@ -179,15 +173,9 @@ class PaperEngine:
     # ---------------- RUN ---------------- #
 
     def run_once(self):
-        print("=== ENGINE START ===")
 
         signals = self.scan_market()
-        print(f"Signals found: {len(signals)}")
-
         trades = self.generate_trades(signals)
-        print(f"Trades generated: {len(trades)}")
 
         self.save_trades(trades)
         self.update_trades()
-
-        print("=== ENGINE END ===")
