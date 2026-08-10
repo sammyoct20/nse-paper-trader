@@ -2,7 +2,6 @@ import pandas as pd
 import yfinance as yf
 import psycopg2
 import os
-import time
 from datetime import datetime
 
 
@@ -10,40 +9,36 @@ class PaperEngine:
 
     def __init__(self):
         db_url = os.getenv("DATABASE_URL")
-        if not db_url:
-            raise Exception("DATABASE_URL not set")
-
         self.conn = psycopg2.connect(db_url)
         self.create_tables()
 
         self.capital = 100000
         self.risk_per_trade = 0.01
 
-    # ---------------- DATABASE ---------------- #
+    # ---------------- DB ---------------- #
 
     def create_tables(self):
         cur = self.conn.cursor()
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY
+            id SERIAL PRIMARY KEY,
+            symbol TEXT,
+            entry FLOAT,
+            stop_loss FLOAT,
+            target FLOAT,
+            qty INT,
+            status TEXT,
+            pnl FLOAT DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            exit_time TIMESTAMP
         );
         """)
-
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS symbol TEXT;")
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry FLOAT;")
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_loss FLOAT;")
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS target FLOAT;")
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS qty INT;")
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS status TEXT;")
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl FLOAT DEFAULT 0;")
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
-        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_time TIMESTAMP;")
 
         self.conn.commit()
         cur.close()
 
-    # ---------------- SCAN MARKET ---------------- #
+    # ---------------- SCAN (FAST) ---------------- #
 
     def scan_market(self):
 
@@ -52,31 +47,44 @@ class PaperEngine:
             "SBIN.NS","ITC.NS","LT.NS","HCLTECH.NS","WIPRO.NS"
         ]
 
+        print("Fetching data (batch)...")
+
+        df = yf.download(
+            tickers=" ".join(symbols),
+            period="5d",
+            interval="15m",
+            group_by="ticker",
+            threads=True
+        )
+
         signals = []
 
         for sym in symbols:
             try:
-                time.sleep(1)  # prevent rate limit
+                data = df[sym]
 
-                df = yf.download(sym, period="5d", interval="15m", progress=False)
-
-                if df.empty or len(df) < 20:
+                if data.empty or len(data) < 30:
                     continue
 
-                close = float(df["Close"].iloc[-1])
+                close = float(data["Close"].iloc[-1])
+                ema20 = data["Close"].ewm(span=20).mean().iloc[-1]
 
-                # 🔴 FORCE SIGNALS (for testing)
-                signals.append({
-                    "symbol": sym,
-                    "price": close
-                })
+                recent_high = data["High"].rolling(20).max().iloc[-2]
+
+                # ✅ Better signal: trend + breakout
+                if close > ema20 and close > recent_high:
+
+                    signals.append({
+                        "symbol": sym,
+                        "price": close
+                    })
 
             except Exception as e:
-                print(f"Error {sym}: {e}")
+                print(f"{sym} error:", e)
 
         return signals
 
-    # ---------------- GENERATE TRADES ---------------- #
+    # ---------------- TRADE ---------------- #
 
     def generate_trades(self, signals):
 
@@ -102,7 +110,7 @@ class PaperEngine:
 
         return trades
 
-    # ---------------- SAVE TRADES ---------------- #
+    # ---------------- SAVE ---------------- #
 
     def save_trades(self, trades):
 
@@ -129,7 +137,7 @@ class PaperEngine:
         self.conn.commit()
         cur.close()
 
-    # ---------------- UPDATE TRADES ---------------- #
+    # ---------------- UPDATE ---------------- #
 
     def update_trades(self):
 
@@ -146,9 +154,8 @@ class PaperEngine:
             trade_id, sym, entry, sl, target, qty = r
 
             try:
-                time.sleep(1)
-
                 df = yf.download(sym, period="1d", interval="5m", progress=False)
+
                 if df.empty:
                     continue
 
@@ -174,8 +181,15 @@ class PaperEngine:
 
     def run_once(self):
 
+        print("=== ENGINE START ===")
+
         signals = self.scan_market()
+        print("Signals:", len(signals))
+
         trades = self.generate_trades(signals)
+        print("Trades:", len(trades))
 
         self.save_trades(trades)
         self.update_trades()
+
+        print("=== ENGINE END ===")
