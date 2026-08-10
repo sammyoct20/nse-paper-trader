@@ -1,70 +1,132 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import yfinance as yf
+import pandas as pd
+
 
 class PaperEngine:
 
     def __init__(self):
-        pass
+        self.capital = 100000
+        self.risk_per_trade = 0.01  # 1%
 
+    # ---------------- SCANNER ----------------
     def scan_market(self):
-        print("Scanning market (Yahoo Finance)...")
+        print("Scanning NIFTY 50 (swing strategy)...")
 
-        # NIFTY 50 sample (you can expand later)
         symbols = [
-            "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS",
-            "ICICIBANK.NS", "LT.NS", "SBIN.NS", "ITC.NS"
+            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS","SBIN.NS",
+            "LT.NS","ITC.NS","HINDUNILVR.NS","KOTAKBANK.NS","AXISBANK.NS","BAJFINANCE.NS",
+            "BHARTIARTL.NS","ASIANPAINT.NS","MARUTI.NS","HCLTECH.NS","SUNPHARMA.NS",
+            "TITAN.NS","ULTRACEMCO.NS","WIPRO.NS","NTPC.NS","POWERGRID.NS","NESTLEIND.NS",
+            "ONGC.NS","TECHM.NS","ADANIENT.NS","ADANIPORTS.NS","COALINDIA.NS",
+            "TATASTEEL.NS","JSWSTEEL.NS","INDUSINDBK.NS","DRREDDY.NS","CIPLA.NS",
+            "APOLLOHOSP.NS","EICHERMOT.NS","GRASIM.NS","HEROMOTOCO.NS","BPCL.NS",
+            "BRITANNIA.NS","DIVISLAB.NS","HDFCLIFE.NS","SBILIFE.NS","BAJAJFINSV.NS",
+            "SHREECEM.NS","UPL.NS","BAJAJ-AUTO.NS","TATAMOTORS.NS","M&M.NS","HINDALCO.NS"
         ]
 
         signals = []
 
+        df = yf.download(
+            tickers=symbols,
+            period="10d",
+            interval="5m",
+            group_by='ticker',
+            auto_adjust=True,
+            threads=True,
+            progress=False
+        )
+
+        if df is None or df.empty:
+            print("No data")
+            return []
+
         for sym in symbols:
             try:
-                df = yf.download(sym, period="5d", interval="5m", progress=False)
+                data = df[sym].dropna()
 
-                if df.empty:
+                if len(data) < 50:
                     continue
 
-                # Simple strategy: price breakout + volume spike
-                last = df.iloc[-1]
-                prev = df.iloc[-2]
+                # -------- INDICATORS --------
+                data["EMA20"] = data["Close"].ewm(span=20).mean()
+                data["EMA50"] = data["Close"].ewm(span=50).mean()
 
-                price = last["Close"]
-                prev_price = prev["Close"]
+                last = data.iloc[-1]
+                prev = data.iloc[-2]
 
-                volume = last["Volume"]
-                avg_volume = df["Volume"].mean()
+                close = float(last["Close"])
+                volume = float(last["Volume"])
+                avg_volume = float(data["Volume"].rolling(20).mean().iloc[-1])
 
-                # Condition (basic but real)
-                if price > prev_price and volume > 1.5 * avg_volume:
+                ema20 = float(last["EMA20"])
+                ema50 = float(last["EMA50"])
+
+                # -------- TREND --------
+                uptrend = close > ema20 > ema50
+
+                # -------- BREAKOUT --------
+                recent_high = float(data["High"].rolling(10).max().iloc[-2])
+                breakout = close > recent_high
+
+                # -------- VOLUME --------
+                vol_spike = volume > 1.5 * avg_volume
+
+                if uptrend and breakout and vol_spike:
+
+                    # -------- RISK MANAGEMENT --------
+                    stop_loss = float(data["Low"].rolling(5).min().iloc[-1])
+                    risk_per_share = close - stop_loss
+
+                    if risk_per_share <= 0:
+                        continue
+
+                    risk_amount = self.capital * self.risk_per_trade
+                    qty = int(risk_amount / risk_per_share)
+
+                    if qty <= 0:
+                        continue
+
+                    target = close + (2 * risk_per_share)  # RR 1:2
+
                     signals.append({
                         "symbol": sym,
-                        "price": round(price, 2),
-                        "volume": int(volume)
+                        "entry": round(close, 2),
+                        "stop_loss": round(stop_loss, 2),
+                        "target": round(target, 2),
+                        "qty": qty
                     })
 
             except Exception as e:
-                print(f"Error fetching {sym}: {e}")
+                print(f"Error {sym}: {e}")
 
         return signals
 
+    # ---------------- SAVE ----------------
     def save(self, signals):
-        print(f"Saving {len(signals)} signals...")
+        print(f"Saving {len(signals)} trades...")
+        for s in signals:
+            print(s)
 
+    # ---------------- RUN ----------------
     def run_once(self):
         try:
             print("=== ENGINE START ===")
 
             signals = self.scan_market()
+
             print(f"Signals found: {len(signals)}")
 
             if signals:
-                print("Sample:", signals[:3])
+                print("Top signals:", signals[:5])
             else:
-                print("No signals found")
+                print("No signals")
 
             self.save(signals)
 
             print("=== ENGINE END ===")
 
         except Exception as e:
-            print("FATAL ERROR in run_once:", str(e))
+            print("FATAL ERROR:", str(e))
             raise
