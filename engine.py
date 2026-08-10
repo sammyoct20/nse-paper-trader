@@ -21,26 +21,28 @@ class PaperEngine:
         self.capital = 100000
         self.risk_per_trade = 0.01
 
-    # ---------------- DATABASE ---------------- #
+    # ---------------- DATABASE (SAFE MIGRATION) ---------------- #
 
     def create_tables(self):
         cur = self.conn.cursor()
 
-        # SAFE (no delete, no shell needed)
+        # Ensure base table exists
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            symbol TEXT,
-            entry FLOAT,
-            stop_loss FLOAT,
-            target FLOAT,
-            qty INT,
-            status TEXT,
-            pnl FLOAT DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            exit_time TIMESTAMP
+            id SERIAL PRIMARY KEY
         );
         """)
+
+        # Add columns safely (no errors if already exists)
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS symbol TEXT;")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry FLOAT;")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_loss FLOAT;")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS target FLOAT;")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS qty INT;")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS status TEXT;")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl FLOAT DEFAULT 0;")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_time TIMESTAMP;")
 
         self.conn.commit()
         cur.close()
@@ -111,7 +113,7 @@ class PaperEngine:
 
         for t in trades:
 
-            # prevent duplicates
+            # prevent duplicate open trades
             cur.execute("""
             SELECT COUNT(*) FROM trades
             WHERE symbol=%s AND status='OPEN'
@@ -154,16 +156,10 @@ class PaperEngine:
 
                 price = float(df["Close"].iloc[-1])
 
-                if price <= sl:
-                    pnl = (price - entry) * qty
-                    cur.execute("""
-                    UPDATE trades
-                    SET status='CLOSED', pnl=%s, exit_time=%s
-                    WHERE id=%s
-                    """, (pnl, datetime.now(), trade_id))
+                if price <= sl or price >= target:
 
-                elif price >= target:
                     pnl = (price - entry) * qty
+
                     cur.execute("""
                     UPDATE trades
                     SET status='CLOSED', pnl=%s, exit_time=%s
