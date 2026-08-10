@@ -21,6 +21,20 @@ class PaperEngine:
   for k,v in vals.items():q.execute("INSERT INTO settings VALUES(%s,%s) ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v",(k,str(v)))
   c.commit();q.close();c.close()
  def run_once(self):
+    print("=== ENGINE START ===")
+
+    signals = self.scan_market()
+    print(f"Signals found: {len(signals)}")
+
+    if signals:
+        print("Sample:", signals[:3])
+    else:
+        print("No signals found")
+
+    self.save(signals)
+
+    print("Saved to DB")
+    print("=== ENGINE END ===")
   cfg=self.config();now=datetime.now(timezone.utc)
   try:
    d=self.client.scan();c=self.con();q=c.cursor()
