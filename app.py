@@ -6,7 +6,6 @@ from engine import PaperEngine
 
 # ---------------- PAGE CONFIG ---------------- #
 st.set_page_config(layout="wide")
-
 st.title("📊 Trading Analytics Dashboard")
 
 # ---------------- DB CONNECTION ---------------- #
@@ -16,19 +15,27 @@ def get_connection():
 
 conn = get_connection()
 
-# ---------------- RUN SCANNER BUTTON ---------------- #
+# ---------------- RUN SCANNER ---------------- #
 st.subheader("⚡ Controls")
 
 if st.button("Run Scanner Now"):
     try:
+        st.info("⏳ Running scanner... please wait")
+
         engine = PaperEngine()
         engine.run_once()
+
         st.success("✅ Scanner executed successfully")
+
     except Exception as e:
         st.error(f"❌ Error running scanner: {e}")
 
 # ---------------- LOAD DATA ---------------- #
-df = pd.read_sql("SELECT * FROM trades ORDER BY created_at ASC", conn)
+try:
+    df = pd.read_sql("SELECT * FROM trades ORDER BY created_at DESC", conn)
+except Exception as e:
+    st.error(f"❌ DB Error: {e}")
+    st.stop()
 
 # ---------------- EMPTY STATE ---------------- #
 if df.empty:
@@ -60,9 +67,8 @@ if not closed.empty:
 
     st.line_chart(closed.set_index("exit_time")["equity"])
 else:
-    st.info("No closed trades yet to show equity curve")
+    st.info("No closed trades yet")
 
-# ---------------- TRADE TABLE ---------------- #
-st.subheader("📋 All Trades")
-
+# ---------------- TABLE ---------------- #
+st.subheader("📋 Trades Data")
 st.dataframe(df, use_container_width=True)
