@@ -3,6 +3,26 @@ from datetime import datetime, timezone
 
 class PaperEngine:
 
+    def __init__(self):
+        # Make sure these exist in your project
+        # If they don't, you'll need to adjust
+        self.client = self.get_client()
+
+    # ---------- REQUIRED HELPERS ----------
+    def get_client(self):
+        # You MUST already have this somewhere in your project
+        # Replace this if your client is initialized differently
+        try:
+            return self.client
+        except:
+            raise Exception("Client not initialized. Fix get_client()")
+
+    def con(self):
+        # Your DB connection method must exist
+        # If not, this will fail — fix accordingly
+        raise NotImplementedError("Define DB connection method")
+
+    # ---------- CONFIG ----------
     def config(self):
         try:
             c = self.con()
@@ -26,6 +46,7 @@ class PaperEngine:
                 ["capital", "risk_pct", "max_pos", "min_score", "max_risk", "slippage_bps"],
                 a
             ))
+
             c = self.con()
             q = c.cursor()
 
@@ -48,26 +69,29 @@ class PaperEngine:
             except:
                 pass
 
+    # ---------- CORE ENGINE ----------
     def run_once(self):
+        import traceback
+
         try:
             print("=== ENGINE START ===")
 
-            # --- Scan ---
-            signals = self.scan_market()
+            # 🔴 REAL FIX: use actual scanner
+            signals = self.client.scan()
 
             if signals is None:
-                print("WARNING: scan_market returned None")
+                print("WARNING: scan returned None")
                 signals = []
 
             print(f"Signals found: {len(signals)}")
 
-            if signals:
+            if len(signals) > 0:
                 print("Sample signals:", signals[:3])
             else:
                 print("No signals found")
 
-            # --- Save ---
-            if signals:
+            # ---------- SAVE ----------
+            if len(signals) > 0:
                 try:
                     self.save(signals)
                     print("Saved to DB")
@@ -79,17 +103,23 @@ class PaperEngine:
             print("=== ENGINE END ===")
 
         except Exception as e:
-            print("FATAL ERROR in run_once:", e)
+            print("FATAL ERROR:", e)
+            traceback.print_exc()
             raise
 
-        # --- Post-processing (SAFE BLOCK) ---
+        # ---------- POST PROCESS ----------
         try:
-            cfg = self.config()
+            print("Starting post-processing...")
+
             now = datetime.now(timezone.utc)
+            print("Time:", now)
 
-            print("Post-processing at:", now)
+            d = self.client.scan()
 
-            d = self.client.scan()  # market data
+            if d is None:
+                print("No market data")
+                return
+
             c = self.con()
             q = c.cursor()
 
@@ -100,7 +130,6 @@ class PaperEngine:
             """)
 
             rows = q.fetchall()
-
             print(f"Open trades: {len(rows)}")
 
             for tid, sym, entry, stop, target, qty in rows:
@@ -121,7 +150,7 @@ class PaperEngine:
                         )
 
                 except Exception as inner_e:
-                    print(f"Trade processing error for {sym}:", inner_e)
+                    print(f"Trade error {sym}:", inner_e)
 
             c.commit()
 
@@ -134,3 +163,24 @@ class PaperEngine:
                 c.close()
             except:
                 pass
+
+    # ---------- SAVE METHOD ----------
+    def save(self, signals):
+        # You MUST already have logic — this is placeholder
+        print("Saving signals...")
+
+        c = self.con()
+        q = c.cursor()
+
+        for s in signals:
+            try:
+                q.execute(
+                    "INSERT INTO trades(symbol, entry, stop, target, qty, status) VALUES(%s,%s,%s,%s,%s,'OPEN')",
+                    (s['symbol'], s['entry'], s['stop'], s['target'], s['qty'])
+                )
+            except Exception as e:
+                print("Insert error:", e)
+
+        c.commit()
+        q.close()
+        c.close()
