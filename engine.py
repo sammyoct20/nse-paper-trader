@@ -7,7 +7,7 @@ import pandas as pd
 class PaperEngine:
 
     def __init__(self):
-        self.capital = 100000
+        self.capital = 500000
         self.risk_per_trade = 0.01  # 1%
 
     # ---------------- SCANNER ----------------
