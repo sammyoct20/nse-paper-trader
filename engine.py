@@ -1,20 +1,30 @@
+import pandas as pd
+import numpy as np
 import yfinance as yf
 import psycopg2
 import os
-import time
 from datetime import datetime
-
 
 class PaperEngine:
 
     def __init__(self):
-        self.capital = 100000
-        self.risk_per_trade = 0.01
-        self.conn = psycopg2.connect(os.environ["DATABASE_URL"])
-        self.create_table()
+        print("=== ENGINE INIT ===")
 
-    def create_table(self):
+        self.db_url = os.getenv("DATABASE_URL")
+        if not self.db_url:
+            raise Exception("DATABASE_URL not set")
+
+        self.conn = psycopg2.connect(self.db_url)
+        self.create_tables()
+
+        self.capital = 100000
+        self.risk_per_trade = 0.01  # 1%
+
+    # ---------------- DB ---------------- #
+
+    def create_tables(self):
         cur = self.conn.cursor()
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
@@ -24,134 +34,186 @@ class PaperEngine:
             target FLOAT,
             qty INT,
             status TEXT,
-            entry_time TIMESTAMP,
-            exit_price FLOAT,
-            pnl FLOAT
-        )
+            pnl FLOAT DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            exit_time TIMESTAMP
+        );
         """)
-        self.conn.commit()
 
-    # ---------- HELPERS ----------
-    def get_open_trades(self):
-        cur = self.conn.cursor()
-        cur.execute("SELECT symbol FROM trades WHERE status='OPEN'")
-        return [r[0] for r in cur.fetchall()]
-
-    # ---------- SAVE ----------
-    def save_trade(self, t):
-        cur = self.conn.cursor()
         cur.execute("""
-        INSERT INTO trades (symbol, entry, stop_loss, target, qty, status, entry_time)
-        VALUES (%s,%s,%s,%s,%s,'OPEN',%s)
-        """, (
-            t["symbol"], t["entry"], t["stop_loss"],
-            t["target"], t["qty"], datetime.now()
-        ))
-        self.conn.commit()
+        CREATE TABLE IF NOT EXISTS signals (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT,
+            price FLOAT,
+            score INT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
 
-    # ---------- UPDATE ----------
+        self.conn.commit()
+        cur.close()
+
+    # ---------------- STRATEGY ---------------- #
+
+    def scan_market(self):
+        print("Scanning NIFTY 50...")
+
+        symbols = [
+            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
+            "SBIN.NS","ITC.NS","LT.NS","HCLTECH.NS","WIPRO.NS",
+            "TATASTEEL.NS","JSWSTEEL.NS","AXISBANK.NS","KOTAKBANK.NS",
+            "MARUTI.NS","BAJAJ-AUTO.NS","TITAN.NS","ULTRACEMCO.NS",
+            "ASIANPAINT.NS","SUNPHARMA.NS"
+        ]
+
+        signals = []
+
+        for sym in symbols:
+            try:
+                df = yf.download(sym, period="10d", interval="15m", progress=False)
+
+                if df.empty or len(df) < 20:
+                    continue
+
+                df["EMA20"] = df["Close"].ewm(span=20).mean()
+                df["EMA50"] = df["Close"].ewm(span=50).mean()
+                df["RSI"] = self.rsi(df["Close"])
+
+                latest = df.iloc[-1]
+
+                score = 0
+
+                if latest["Close"] > latest["EMA20"]:
+                    score += 1
+                if latest["EMA20"] > latest["EMA50"]:
+                    score += 1
+                if 50 < latest["RSI"] < 70:
+                    score += 1
+
+                if score >= 2:
+                    signals.append({
+                        "symbol": sym,
+                        "price": float(latest["Close"]),
+                        "score": score
+                    })
+
+            except Exception as e:
+                print(f"Error {sym}: {e}")
+
+        return signals
+
+    def rsi(self, series, period=14):
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    # ---------------- TRADING ---------------- #
+
+    def generate_trades(self, signals):
+        trades = []
+
+        for s in signals:
+            entry = s["price"]
+
+            sl = entry * 0.99
+            target = entry * 1.02
+
+            risk_per_share = entry - sl
+            capital_risk = self.capital * self.risk_per_trade
+
+            qty = int(capital_risk / risk_per_share) if risk_per_share > 0 else 0
+
+            trades.append({
+                "symbol": s["symbol"],
+                "entry": entry,
+                "stop_loss": sl,
+                "target": target,
+                "qty": qty,
+                "status": "OPEN"
+            })
+
+        return trades
+
+    def save_trades(self, trades):
+        cur = self.conn.cursor()
+
+        for t in trades:
+            # prevent duplicates
+            cur.execute("""
+                SELECT COUNT(*) FROM trades
+                WHERE symbol=%s AND status='OPEN'
+            """, (t["symbol"],))
+            exists = cur.fetchone()[0]
+
+            if exists > 0:
+                continue
+
+            cur.execute("""
+            INSERT INTO trades (symbol, entry, stop_loss, target, qty, status)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            """, (
+                t["symbol"], t["entry"], t["stop_loss"],
+                t["target"], t["qty"], t["status"]
+            ))
+
+        self.conn.commit()
+        cur.close()
+
     def update_trades(self):
         cur = self.conn.cursor()
-        cur.execute("SELECT id,symbol,entry,stop_loss,target,qty FROM trades WHERE status='OPEN'")
+
+        cur.execute("""
+            SELECT id, symbol, entry, stop_loss, target, qty
+            FROM trades WHERE status='OPEN'
+        """)
+
         rows = cur.fetchall()
 
         for r in rows:
-            trade_id, sym, entry, sl, target, qty = r
+            id, sym, entry, sl, target, qty = r
 
             try:
                 df = yf.download(sym, period="1d", interval="5m", progress=False)
                 if df.empty:
                     continue
 
-                price = float(df["Close"].iloc[-1])
+                price = df["Close"].iloc[-1]
 
                 if price <= sl:
                     pnl = (price - entry) * qty
-                    cur.execute("UPDATE trades SET status='SL HIT', exit_price=%s, pnl=%s WHERE id=%s",
-                                (price, pnl, trade_id))
+                    cur.execute("""
+                        UPDATE trades
+                        SET status='CLOSED', pnl=%s, exit_time=NOW()
+                        WHERE id=%s
+                    """, (pnl, id))
 
                 elif price >= target:
                     pnl = (price - entry) * qty
-                    cur.execute("UPDATE trades SET status='TARGET HIT', exit_price=%s, pnl=%s WHERE id=%s",
-                                (price, pnl, trade_id))
+                    cur.execute("""
+                        UPDATE trades
+                        SET status='CLOSED', pnl=%s, exit_time=NOW()
+                        WHERE id=%s
+                    """, (pnl, id))
 
             except Exception as e:
                 print("Update error:", e)
 
         self.conn.commit()
+        cur.close()
 
-    # ---------- SCANNER ----------
-    def scan_market(self):
+    # ---------------- RUN ---------------- #
 
-        symbols = ["TCS.NS", "INFY.NS", "TITAN.NS", "HDFCBANK.NS"]
+    def run_once(self):
+        print("=== ENGINE START ===")
 
-        signals = []
+        signals = self.scan_market()
+        print("Signals:", len(signals))
 
-        for sym in symbols:
-            try:
-                df = yf.download(sym, period="5d", interval="5m", progress=False)
+        trades = self.generate_trades(signals)
 
-                if df.empty or len(df) < 50:
-                    continue
+        self.save_trades(trades)
+        self.update_trades()
 
-                close = float(df["Close"].iloc[-1])
-                sl = float(df["Low"].rolling(5).min().iloc[-1])
-                risk = close - sl
-
-                if risk <= 0:
-                    continue
-
-                target = close + 2 * risk
-                qty = int((self.capital * self.risk_per_trade) / risk)
-
-                if qty <= 0:
-                    continue
-
-                signals.append({
-                    "symbol": sym,
-                    "entry": round(close, 2),
-                    "stop_loss": round(sl, 2),
-                    "target": round(target, 2),
-                    "qty": qty
-                })
-
-            except Exception as e:
-                print("Scan error:", e)
-
-        return signals[:3]
-
-    # ---------- LOOP ----------
-    def run_loop(self):
-        print("🚀 Scanner started...")
-
-        while True:
-            try:
-                print("\nCycle:", datetime.now())
-
-                self.update_trades()
-
-                open_trades = self.get_open_trades()
-                MAX_TRADES = 3
-
-                if len(open_trades) < MAX_TRADES:
-
-                    signals = self.scan_market()
-
-                    for s in signals:
-
-                        if s["symbol"] in open_trades:
-                            continue
-
-                        if len(open_trades) >= MAX_TRADES:
-                            break
-
-                        self.save_trade(s)
-                        open_trades.append(s["symbol"])
-
-                else:
-                    print("Max trades reached")
-
-            except Exception as e:
-                print("Loop error:", e)
-
-            time.sleep(300)
+        print("=== ENGINE END ===")
