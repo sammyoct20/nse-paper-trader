@@ -68,7 +68,7 @@ class PaperEngine:
                 close = float(df["Close"].iloc[-1])
                 ema20 = df["Close"].ewm(span=20).mean().iloc[-1]
 
-                if close > ema20:
+                if True:
                     signals.append({
                         "symbol": sym,
                         "price": close
