@@ -12,7 +12,7 @@ class PaperEngine:
 
     # ---------------- SCANNER ----------------
     def scan_market(self):
-        print("Scanning NIFTY 50 (optimized swing)...")
+        print("Scanning NIFTY 50 (scoring strategy)...")
 
         symbols = [
             "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS","SBIN.NS",
@@ -45,7 +45,7 @@ class PaperEngine:
 
             for sym in symbols:
                 try:
-                    # 🔹 Skip if Yahoo failed for this symbol
+                    # Skip failed Yahoo symbols
                     if sym not in df.columns:
                         continue
 
@@ -67,17 +67,25 @@ class PaperEngine:
                     ema20 = float(last["EMA20"])
                     ema50 = float(last["EMA50"])
 
-                    # -------- CONDITIONS --------
-                    uptrend = close > ema20 > ema50
+                    # -------- SCORING SYSTEM --------
+                    score = 0
 
+                    # Trend
+                    if close > ema20 > ema50:
+                        score += 1
+
+                    # Breakout
                     recent_high = float(data["High"].rolling(15).max().iloc[-2])
-                    breakout = close >= recent_high * 0.995
+                    if close >= recent_high * 0.995:
+                        score += 1
 
-                    vol_spike = volume > 1.2 * avg_volume
+                    # Volume
+                    if volume > 1.2 * avg_volume:
+                        score += 1
 
-                    if uptrend and breakout and vol_spike:
+                    # -------- SIGNAL FILTER --------
+                    if score >= 2:
 
-                        # -------- RISK MANAGEMENT --------
                         stop_loss = float(data["Low"].rolling(5).min().iloc[-1])
                         risk_per_share = close - stop_loss
 
@@ -97,7 +105,8 @@ class PaperEngine:
                             "entry": round(close, 2),
                             "stop_loss": round(stop_loss, 2),
                             "target": round(target, 2),
-                            "qty": qty
+                            "qty": qty,
+                            "score": score
                         })
 
                 except Exception as inner_e:
