@@ -3,9 +3,7 @@ import pandas as pd
 import psycopg2
 import os
 
-st.set_page_config(layout="wide")
-
-st.title("📊 Trading Analytics Dashboard")
+st.title("📊 Trading Dashboard")
 
 conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 
@@ -15,31 +13,24 @@ if df.empty:
     st.warning("No trades yet")
     st.stop()
 
-# ---------------- METRICS ---------------- #
-
-total = len(df)
+# Metrics
 closed = df[df["status"] == "CLOSED"]
 
-win = len(closed[closed["pnl"] > 0])
+total = len(df)
+wins = len(closed[closed["pnl"] > 0])
 loss = len(closed[closed["pnl"] <= 0])
 
-win_rate = (win / len(closed) * 100) if len(closed) > 0 else 0
+win_rate = (wins / len(closed) * 100) if len(closed) else 0
 total_pnl = closed["pnl"].sum()
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Total Trades", total)
-col2.metric("Win Rate", f"{win_rate:.2f}%")
-col3.metric("PnL", f"{total_pnl:.2f}")
+st.metric("Total Trades", total)
+st.metric("Win Rate", f"{win_rate:.2f}%")
+st.metric("PnL", f"{total_pnl:.2f}")
 
-# ---------------- EQUITY CURVE ---------------- #
-
+# Equity Curve
 closed = closed.sort_values("exit_time")
 closed["equity"] = closed["pnl"].cumsum()
 
-st.subheader("Equity Curve")
 st.line_chart(closed.set_index("exit_time")["equity"])
 
-# ---------------- TRADES TABLE ---------------- #
-
-st.subheader("All Trades")
-st.dataframe(df, use_container_width=True)
+st.dataframe(df)
