@@ -1,156 +1,157 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
 import yfinance as yf
-import pandas as pd
+import psycopg2
+import os
+import time
+from datetime import datetime
 
 
 class PaperEngine:
 
     def __init__(self):
         self.capital = 100000
-        self.risk_per_trade = 0.01  # 1%
+        self.risk_per_trade = 0.01
+        self.conn = psycopg2.connect(os.environ["DATABASE_URL"])
+        self.create_table()
 
-    # ---------------- SCANNER ----------------
+    def create_table(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT,
+            entry FLOAT,
+            stop_loss FLOAT,
+            target FLOAT,
+            qty INT,
+            status TEXT,
+            entry_time TIMESTAMP,
+            exit_price FLOAT,
+            pnl FLOAT
+        )
+        """)
+        self.conn.commit()
+
+    # ---------- HELPERS ----------
+    def get_open_trades(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT symbol FROM trades WHERE status='OPEN'")
+        return [r[0] for r in cur.fetchall()]
+
+    # ---------- SAVE ----------
+    def save_trade(self, t):
+        cur = self.conn.cursor()
+        cur.execute("""
+        INSERT INTO trades (symbol, entry, stop_loss, target, qty, status, entry_time)
+        VALUES (%s,%s,%s,%s,%s,'OPEN',%s)
+        """, (
+            t["symbol"], t["entry"], t["stop_loss"],
+            t["target"], t["qty"], datetime.now()
+        ))
+        self.conn.commit()
+
+    # ---------- UPDATE ----------
+    def update_trades(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id,symbol,entry,stop_loss,target,qty FROM trades WHERE status='OPEN'")
+        rows = cur.fetchall()
+
+        for r in rows:
+            trade_id, sym, entry, sl, target, qty = r
+
+            try:
+                df = yf.download(sym, period="1d", interval="5m", progress=False)
+                if df.empty:
+                    continue
+
+                price = float(df["Close"].iloc[-1])
+
+                if price <= sl:
+                    pnl = (price - entry) * qty
+                    cur.execute("UPDATE trades SET status='SL HIT', exit_price=%s, pnl=%s WHERE id=%s",
+                                (price, pnl, trade_id))
+
+                elif price >= target:
+                    pnl = (price - entry) * qty
+                    cur.execute("UPDATE trades SET status='TARGET HIT', exit_price=%s, pnl=%s WHERE id=%s",
+                                (price, pnl, trade_id))
+
+            except Exception as e:
+                print("Update error:", e)
+
+        self.conn.commit()
+
+    # ---------- SCANNER ----------
     def scan_market(self):
-        print("Scanning NIFTY 50 (refined strategy)...")
 
-        symbols = [
-            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS","SBIN.NS",
-            "LT.NS","ITC.NS","HINDUNILVR.NS","KOTAKBANK.NS","AXISBANK.NS","BAJFINANCE.NS",
-            "BHARTIARTL.NS","ASIANPAINT.NS","MARUTI.NS","HCLTECH.NS","SUNPHARMA.NS",
-            "TITAN.NS","ULTRACEMCO.NS","WIPRO.NS","NTPC.NS","POWERGRID.NS","NESTLEIND.NS",
-            "ONGC.NS","TECHM.NS","ADANIENT.NS","ADANIPORTS.NS","COALINDIA.NS",
-            "TATASTEEL.NS","JSWSTEEL.NS","INDUSINDBK.NS","DRREDDY.NS","CIPLA.NS",
-            "APOLLOHOSP.NS","EICHERMOT.NS","GRASIM.NS","HEROMOTOCO.NS","BPCL.NS",
-            "BRITANNIA.NS","DIVISLAB.NS","HDFCLIFE.NS","SBILIFE.NS","BAJAJFINSV.NS",
-            "SHREECEM.NS","UPL.NS","BAJAJ-AUTO.NS","TATAMOTORS.NS","M&M.NS","HINDALCO.NS"
-        ]
+        symbols = ["TCS.NS", "INFY.NS", "TITAN.NS", "HDFCBANK.NS"]
 
         signals = []
 
-        try:
-            df = yf.download(
-                tickers=symbols,
-                period="10d",
-                interval="5m",
-                group_by='ticker',
-                auto_adjust=True,
-                threads=True,
-                progress=False
-            )
+        for sym in symbols:
+            try:
+                df = yf.download(sym, period="5d", interval="5m", progress=False)
 
-            if df is None or df.empty:
-                print("No data")
-                return []
+                if df.empty or len(df) < 50:
+                    continue
 
-            for sym in symbols:
-                try:
-                    if sym not in df.columns:
-                        continue
+                close = float(df["Close"].iloc[-1])
+                sl = float(df["Low"].rolling(5).min().iloc[-1])
+                risk = close - sl
 
-                    data = df[sym].dropna()
+                if risk <= 0:
+                    continue
 
-                    if len(data) < 50:
-                        continue
+                target = close + 2 * risk
+                qty = int((self.capital * self.risk_per_trade) / risk)
 
-                    # -------- INDICATORS --------
-                    data["EMA20"] = data["Close"].ewm(span=20).mean()
-                    data["EMA50"] = data["Close"].ewm(span=50).mean()
+                if qty <= 0:
+                    continue
 
-                    last = data.iloc[-1]
+                signals.append({
+                    "symbol": sym,
+                    "entry": round(close, 2),
+                    "stop_loss": round(sl, 2),
+                    "target": round(target, 2),
+                    "qty": qty
+                })
 
-                    close = float(last["Close"])
-                    volume = float(last["Volume"])
-                    avg_volume = float(data["Volume"].rolling(20).mean().iloc[-1])
+            except Exception as e:
+                print("Scan error:", e)
 
-                    ema20 = float(last["EMA20"])
-                    ema50 = float(last["EMA50"])
+        return signals[:3]
 
-                    # -------- SCORING --------
-                    score = 0
+    # ---------- LOOP ----------
+    def run_loop(self):
+        print("🚀 Scanner started...")
 
-                    if close > ema20 > ema50:
-                        score += 1
+        while True:
+            try:
+                print("\nCycle:", datetime.now())
 
-                    recent_high = float(data["High"].rolling(15).max().iloc[-2])
-                    if close >= recent_high * 0.995:
-                        score += 1
+                self.update_trades()
 
-                    if volume > 1.2 * avg_volume:
-                        score += 1
+                open_trades = self.get_open_trades()
+                MAX_TRADES = 3
 
-                    # -------- STRICT FILTER --------
-                    if score < 2:
-                        continue
+                if len(open_trades) < MAX_TRADES:
 
-                    # -------- RISK MANAGEMENT --------
-                    stop_loss = float(data["Low"].rolling(5).min().iloc[-1])
-                    risk_per_share = close - stop_loss
+                    signals = self.scan_market()
 
-                    # ❌ Reject tiny SL (critical fix)
-                    if risk_per_share < close * 0.005:
-                        continue
+                    for s in signals:
 
-                    risk_amount = self.capital * self.risk_per_trade
-                    qty = int(risk_amount / risk_per_share)
+                        if s["symbol"] in open_trades:
+                            continue
 
-                    if qty <= 0:
-                        continue
+                        if len(open_trades) >= MAX_TRADES:
+                            break
 
-                    target = close + (2 * risk_per_share)
+                        self.save_trade(s)
+                        open_trades.append(s["symbol"])
 
-                    # ❌ Reject tiny targets
-                    if (target - close) / close < 0.005:
-                        continue
+                else:
+                    print("Max trades reached")
 
-                    signals.append({
-                        "symbol": sym,
-                        "entry": round(close, 2),
-                        "stop_loss": round(stop_loss, 2),
-                        "target": round(target, 2),
-                        "qty": qty,
-                        "score": score,
-                        "risk_pct": round((risk_per_share / close) * 100, 2)
-                    })
+            except Exception as e:
+                print("Loop error:", e)
 
-                except Exception as inner_e:
-                    print(f"Error {sym}: {inner_e}")
-
-        except Exception as e:
-            print("Batch error:", e)
-
-        # -------- FINAL FILTERING --------
-        signals = sorted(signals, key=lambda x: (x['score'], x['risk_pct']), reverse=True)
-
-        # ❌ Limit trades (very important)
-        signals = signals[:5]
-
-        return signals
-
-    # ---------------- SAVE ----------------
-    def save(self, signals):
-        print(f"Saving {len(signals)} trades...")
-        for s in signals:
-            print(s)
-
-    # ---------------- RUN ----------------
-    def run_once(self):
-        try:
-            print("=== ENGINE START ===")
-
-            signals = self.scan_market()
-
-            print(f"Signals found: {len(signals)}")
-
-            if signals:
-                print("Top signals:", signals)
-            else:
-                print("No signals")
-
-            self.save(signals)
-
-            print("=== ENGINE END ===")
-
-        except Exception as e:
-            print("FATAL ERROR:", str(e))
-            raise
+            time.sleep(300)
