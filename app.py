@@ -19,16 +19,36 @@ conn = get_connection()
 st.subheader("⚡ Controls")
 
 if st.button("Run Scanner Now"):
+
+    progress = st.progress(0)
+    status = st.empty()
+
     try:
-        st.info("⏳ Running scanner... please wait")
-
         engine = PaperEngine()
-        engine.run_once()
 
-        st.success("✅ Scanner executed successfully")
+        status.text("🔍 Scanning market...")
+        signals = engine.scan_market()
+        progress.progress(30)
+
+        status.text("📊 Generating trades...")
+        trades = engine.generate_trades(signals)
+        progress.progress(60)
+
+        status.text("💾 Saving trades...")
+        engine.save_trades(trades)
+        progress.progress(80)
+
+        status.text("🔄 Updating trades...")
+        engine.update_trades()
+        progress.progress(100)
+
+        status.text("✅ Scanner completed")
+        st.success(f"{len(trades)} trades processed")
+
+        st.rerun()   # 🔥 refresh UI automatically
 
     except Exception as e:
-        st.error(f"❌ Error running scanner: {e}")
+        st.error(f"❌ Error: {e}")
 
 # ---------------- LOAD DATA ---------------- #
 try:
@@ -64,11 +84,10 @@ st.subheader("📈 Equity Curve")
 if not closed.empty:
     closed = closed.sort_values("exit_time")
     closed["equity"] = closed["pnl"].cumsum()
-
     st.line_chart(closed.set_index("exit_time")["equity"])
 else:
     st.info("No closed trades yet")
 
-# ---------------- TABLE ---------------- #
+# ---------------- TRADE TABLE ---------------- #
 st.subheader("📋 Trades Data")
 st.dataframe(df, use_container_width=True)
