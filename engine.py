@@ -2,6 +2,7 @@ import pandas as pd
 import yfinance as yf
 import psycopg2
 import os
+import time
 from datetime import datetime
 
 
@@ -21,19 +22,17 @@ class PaperEngine:
         self.capital = 100000
         self.risk_per_trade = 0.01
 
-    # ---------------- DATABASE (SAFE MIGRATION) ---------------- #
+    # ---------------- DATABASE ---------------- #
 
     def create_tables(self):
         cur = self.conn.cursor()
 
-        # Ensure base table exists
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY
         );
         """)
 
-        # Add columns safely (no errors if already exists)
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS symbol TEXT;")
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry FLOAT;")
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_loss FLOAT;")
@@ -47,7 +46,7 @@ class PaperEngine:
         self.conn.commit()
         cur.close()
 
-    # ---------------- STRATEGY ---------------- #
+    # ---------------- SCAN MARKET ---------------- #
 
     def scan_market(self):
 
@@ -60,6 +59,8 @@ class PaperEngine:
 
         for sym in symbols:
             try:
+                time.sleep(1)   # 🔥 prevents Yahoo rate limit
+
                 df = yf.download(sym, period="5d", interval="15m", progress=False)
 
                 if df.empty or len(df) < 20:
@@ -68,6 +69,7 @@ class PaperEngine:
                 close = float(df["Close"].iloc[-1])
                 ema20 = df["Close"].ewm(span=20).mean().iloc[-1]
 
+                # 🔧 TEMP: force signals (remove later)
                 if True:
                     signals.append({
                         "symbol": sym,
@@ -79,7 +81,7 @@ class PaperEngine:
 
         return signals
 
-    # ---------------- TRADE CREATION ---------------- #
+    # ---------------- GENERATE TRADES ---------------- #
 
     def generate_trades(self, signals):
 
@@ -113,7 +115,7 @@ class PaperEngine:
 
         for t in trades:
 
-            # prevent duplicate open trades
+            # prevent duplicate trades
             cur.execute("""
             SELECT COUNT(*) FROM trades
             WHERE symbol=%s AND status='OPEN'
@@ -150,6 +152,8 @@ class PaperEngine:
             trade_id, sym, entry, sl, target, qty = r
 
             try:
+                time.sleep(1)
+
                 df = yf.download(sym, period="1d", interval="5m", progress=False)
                 if df.empty:
                     continue
@@ -178,7 +182,10 @@ class PaperEngine:
         print("=== ENGINE START ===")
 
         signals = self.scan_market()
+        print(f"Signals found: {len(signals)}")
+
         trades = self.generate_trades(signals)
+        print(f"Trades generated: {len(trades)}")
 
         self.save_trades(trades)
         self.update_trades()
