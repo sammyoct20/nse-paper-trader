@@ -12,7 +12,7 @@ class PaperEngine:
 
     # ---------------- SCANNER ----------------
     def scan_market(self):
-        print("Scanning NIFTY 50 (scoring strategy)...")
+        print("Scanning NIFTY 50 (refined strategy)...")
 
         symbols = [
             "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS","SBIN.NS",
@@ -45,7 +45,6 @@ class PaperEngine:
 
             for sym in symbols:
                 try:
-                    # Skip failed Yahoo symbols
                     if sym not in df.columns:
                         continue
 
@@ -67,53 +66,64 @@ class PaperEngine:
                     ema20 = float(last["EMA20"])
                     ema50 = float(last["EMA50"])
 
-                    # -------- SCORING SYSTEM --------
+                    # -------- SCORING --------
                     score = 0
 
-                    # Trend
                     if close > ema20 > ema50:
                         score += 1
 
-                    # Breakout
                     recent_high = float(data["High"].rolling(15).max().iloc[-2])
                     if close >= recent_high * 0.995:
                         score += 1
 
-                    # Volume
                     if volume > 1.2 * avg_volume:
                         score += 1
 
-                    # -------- SIGNAL FILTER --------
-                    if score >= 2:
+                    # -------- STRICT FILTER --------
+                    if score < 2:
+                        continue
 
-                        stop_loss = float(data["Low"].rolling(5).min().iloc[-1])
-                        risk_per_share = close - stop_loss
+                    # -------- RISK MANAGEMENT --------
+                    stop_loss = float(data["Low"].rolling(5).min().iloc[-1])
+                    risk_per_share = close - stop_loss
 
-                        if risk_per_share <= 0:
-                            continue
+                    # ❌ Reject tiny SL (critical fix)
+                    if risk_per_share < close * 0.005:
+                        continue
 
-                        risk_amount = self.capital * self.risk_per_trade
-                        qty = int(risk_amount / risk_per_share)
+                    risk_amount = self.capital * self.risk_per_trade
+                    qty = int(risk_amount / risk_per_share)
 
-                        if qty <= 0:
-                            continue
+                    if qty <= 0:
+                        continue
 
-                        target = close + (2 * risk_per_share)
+                    target = close + (2 * risk_per_share)
 
-                        signals.append({
-                            "symbol": sym,
-                            "entry": round(close, 2),
-                            "stop_loss": round(stop_loss, 2),
-                            "target": round(target, 2),
-                            "qty": qty,
-                            "score": score
-                        })
+                    # ❌ Reject tiny targets
+                    if (target - close) / close < 0.005:
+                        continue
+
+                    signals.append({
+                        "symbol": sym,
+                        "entry": round(close, 2),
+                        "stop_loss": round(stop_loss, 2),
+                        "target": round(target, 2),
+                        "qty": qty,
+                        "score": score,
+                        "risk_pct": round((risk_per_share / close) * 100, 2)
+                    })
 
                 except Exception as inner_e:
-                    print(f"Error processing {sym}: {inner_e}")
+                    print(f"Error {sym}: {inner_e}")
 
         except Exception as e:
             print("Batch error:", e)
+
+        # -------- FINAL FILTERING --------
+        signals = sorted(signals, key=lambda x: (x['score'], x['risk_pct']), reverse=True)
+
+        # ❌ Limit trades (very important)
+        signals = signals[:5]
 
         return signals
 
@@ -133,7 +143,7 @@ class PaperEngine:
             print(f"Signals found: {len(signals)}")
 
             if signals:
-                print("Top signals:", signals[:5])
+                print("Top signals:", signals)
             else:
                 print("No signals")
 
