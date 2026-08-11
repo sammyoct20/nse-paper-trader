@@ -3,28 +3,28 @@ import pandas as pd
 import psycopg2
 import os
 from datetime import datetime
+import time
 
 class PaperEngine:
 
     def __init__(self):
         self.db_url = os.getenv("DATABASE_URL")
         self.conn = psycopg2.connect(self.db_url)
+        self.capital = 200000
+        self.max_trades = 3
+        self.risk_per_trade = 0.02
         self.create_tables()
 
-        # config
-        self.capital = 100000
-        self.max_trades = 3
-        self.risk_per_trade = 0.01  # 1%
-
-        # Nifty 50 sample (you can expand)
+        # NIFTY 50 stocks
         self.symbols = [
-            "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS",
-            "INFY.NS", "TCS.NS", "LT.NS"
+            "RELIANCE.NS","TCS.NS","INFY.NS","ICICIBANK.NS","HDFCBANK.NS",
+            "LT.NS","SBIN.NS","AXISBANK.NS","KOTAKBANK.NS","ITC.NS",
+            "HINDUNILVR.NS","BHARTIARTL.NS","ASIANPAINT.NS","MARUTI.NS",
+            "BAJFINANCE.NS","BAJAJFINSV.NS","SUNPHARMA.NS","ULTRACEMCO.NS",
+            "NESTLEIND.NS","TITAN.NS"
         ]
 
-    # -----------------------------
-    # DB TABLES
-    # -----------------------------
+    # ---------------- DB ----------------
     def create_tables(self):
         cur = self.conn.cursor()
 
@@ -37,157 +37,186 @@ class PaperEngine:
             target FLOAT,
             qty INT,
             status TEXT,
-            pnl FLOAT,
+            entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            exit_time TIMESTAMP,
             exit_reason TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            exit_time TIMESTAMP
+            pnl FLOAT
         );
         """)
 
         self.conn.commit()
         cur.close()
 
-    # -----------------------------
-    # FETCH PRICE
-    # -----------------------------
-    def get_price(self, sym):
+    # ---------------- DATA ----------------
+    def get_data(self, symbol):
         try:
-            df = yf.download(sym, period="1d", interval="5m", progress=False)
+            df = yf.download(
+                symbol,
+                period="5d",
+                interval="5m",
+                progress=False,
+                auto_adjust=True
+            )
             if df.empty:
                 return None
-            return float(df["Close"].iloc[-1])
+
+            df["EMA20"] = df["Close"].ewm(span=20).mean()
+            df["EMA50"] = df["Close"].ewm(span=50).mean()
+
+            return df
+
         except:
             return None
 
-    # -----------------------------
-    # STRATEGY
-    # -----------------------------
-    def generate_signal(self, sym):
-
-        df = yf.download(sym, period="5d", interval="15m", progress=False)
-        if df.empty or len(df) < 20:
+    # ---------------- STRATEGY ----------------
+    def generate_signal(self, symbol):
+        df = self.get_data(symbol)
+        if df is None or len(df) < 50:
             return None
 
-        df["ema20"] = df["Close"].ewm(span=20).mean()
-        df["ema50"] = df["Close"].ewm(span=50).mean()
-
         latest = df.iloc[-1]
+        prev = df.iloc[-2]
 
-        if latest["Close"] > latest["ema20"] > latest["ema50"]:
-            return "BUY"
+        price = float(latest["Close"])
+        ema20 = float(latest["EMA20"])
+        ema50 = float(latest["EMA50"])
+        volume = float(latest["Volume"])
+        avg_volume = float(df["Volume"].tail(20).mean())
 
-        return None
+        # 🔴 Strong filters only
+        if not (price > ema20 > ema50):
+            return None
 
-    # -----------------------------
-    # OPEN TRADES COUNT
-    # -----------------------------
-    def open_trades_count(self):
-        cur = self.conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'")
-        count = cur.fetchone()[0]
-        cur.close()
-        return count
+        if volume < 1.5 * avg_volume:
+            return None
 
-    # -----------------------------
-    # CREATE TRADE
-    # -----------------------------
-    def create_trade(self, sym, price):
+        if price < prev["High"]:
+            return None
 
-        stop_loss = price * 0.99
-        target = price * 1.02
+        return {
+            "symbol": symbol,
+            "entry": price
+        }
 
-        risk_amt = self.capital * self.risk_per_trade
-        qty = int(risk_amt / (price - stop_loss))
+    # ---------------- POSITION SIZING ----------------
+    def position_size(self, entry):
+        risk_amount = self.capital * self.risk_per_trade
+        sl = entry * 0.99
+        risk_per_share = entry - sl
 
+        if risk_per_share <= 0:
+            return 0
+
+        qty = int(risk_amount / risk_per_share)
+        return max(qty, 1)
+
+    # ---------------- SAVE TRADE ----------------
+    def save_trade(self, trade):
         cur = self.conn.cursor()
 
         cur.execute("""
-        INSERT INTO trades (symbol, entry, stop_loss, target, qty, status, pnl)
-        VALUES (%s,%s,%s,%s,%s,'OPEN',0)
-        """, (sym, price, stop_loss, target, qty))
+        INSERT INTO trades (symbol, entry, stop_loss, target, qty, status)
+        VALUES (%s, %s, %s, %s, %s, 'OPEN')
+        """, (
+            trade["symbol"],
+            trade["entry"],
+            trade["stop_loss"],
+            trade["target"],
+            trade["qty"]
+        ))
 
         self.conn.commit()
         cur.close()
 
-    # -----------------------------
-    # UPDATE TRADES (AUTO CLOSE)
-    # -----------------------------
-    def update_trades(self):
+    # ---------------- FETCH OPEN TRADES ----------------
+    def get_open_trades(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, symbol, entry, stop_loss, target, qty FROM trades WHERE status='OPEN'")
+        rows = cur.fetchall()
+        cur.close()
+        return rows
 
+    # ---------------- EXIT LOGIC ----------------
+    def update_trades(self):
+        trades = self.get_open_trades()
         cur = self.conn.cursor()
 
-        cur.execute("SELECT id, symbol, entry, stop_loss, target, qty FROM trades WHERE status='OPEN'")
-        trades = cur.fetchall()
-
         for t in trades:
-            trade_id, sym, entry, sl, tgt, qty = t
+            trade_id, symbol, entry, sl, target, qty = t
 
-            price = self.get_price(sym)
-            if price is None:
+            df = self.get_data(symbol)
+            if df is None:
                 continue
+
+            price = float(df["Close"].iloc[-1])
 
             exit_reason = None
 
             if price <= sl:
-                exit_reason = "STOP LOSS HIT"
+                exit_reason = "STOP LOSS"
 
-            elif price >= tgt:
+            elif price >= target:
                 exit_reason = "TARGET HIT"
+
+            # Time exit (after 2 days approx)
+            cur.execute("SELECT entry_time FROM trades WHERE id=%s", (trade_id,))
+            entry_time = cur.fetchone()[0]
+
+            if (datetime.now() - entry_time).days >= 2:
+                exit_reason = "TIME EXIT"
 
             if exit_reason:
                 pnl = (price - entry) * qty
 
-                print(f"Closing {sym} | {exit_reason}")
-
                 cur.execute("""
                 UPDATE trades
                 SET status='CLOSED',
-                    pnl=%s,
+                    exit_time=NOW(),
                     exit_reason=%s,
-                    exit_time=%s
+                    pnl=%s
                 WHERE id=%s
-                """, (pnl, exit_reason, datetime.now(), trade_id))
+                """, (exit_reason, pnl, trade_id))
 
         self.conn.commit()
         cur.close()
 
-    # -----------------------------
-    # MAIN RUN
-    # -----------------------------
+    # ---------------- MAIN RUN ----------------
     def run_once(self):
 
         self.update_trades()
 
-        trades_open = self.open_trades_count()
+        open_trades = self.get_open_trades()
+        if len(open_trades) >= self.max_trades:
+            return [], []
 
-        signals = 0
-        trades_created = 0
+        signals = []
+        trades = []
 
         for sym in self.symbols:
-
-            if trades_open >= self.max_trades:
-                break
-
             signal = self.generate_signal(sym)
 
-            if signal == "BUY":
-                price = self.get_price(sym)
-                if price is None:
-                    continue
+            if signal:
+                entry = signal["entry"]
+                sl = entry * 0.99
+                target = entry * 1.02
+                qty = self.position_size(entry)
 
-                self.create_trade(sym, price)
+                trade = {
+                    "symbol": sym,
+                    "entry": entry,
+                    "stop_loss": sl,
+                    "target": target,
+                    "qty": qty
+                }
 
-                signals += 1
-                trades_created += 1
-                trades_open += 1
+                self.save_trade(trade)
 
-        # DEBUG
-        cur = self.conn.cursor()
-        cur.execute("SELECT symbol, status, pnl, exit_reason FROM trades")
-        rows = cur.fetchall()
-        print("==== DB DATA ====")
-        for r in rows:
-            print(r)
-        cur.close()
+                signals.append(signal)
+                trades.append(trade)
 
-        return signals, trades_created
+                if len(self.get_open_trades()) >= self.max_trades:
+                    break
+
+            time.sleep(0.5)  # avoid rate limit
+
+        return signals, trades
