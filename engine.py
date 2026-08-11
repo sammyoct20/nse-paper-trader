@@ -42,10 +42,21 @@ class PaperEngine:
 
     def scan_market(self):
 
-        symbols = [
-            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
-            "SBIN.NS","ITC.NS","LT.NS","HCLTECH.NS","WIPRO.NS"
-        ]
+    symbols = [
+        "HDFCBANK.NS", "ICICIBANK.NS", "RELIANCE.NS", "BHARTIARTL.NS",
+        "LT.NS", "SBIN.NS", "INFY.NS", "AXISBANK.NS",
+        "BAJFINANCE.NS", "M&M.NS", "ADANIENT.NS", "ADANIPORTS.NS",
+        "APOLLOHOSP.NS", "ASIANPAINT.NS", "BAJAJ-AUTO.NS", "BAJAJFINSV.NS",
+        "BEL.NS", "CIPLA.NS", "COALINDIA.NS", "DRREDDY.NS",
+        "EICHERMOT.NS", "ETERNAL.NS", "GRASIM.NS", "HCLTECH.NS",
+        "HDFCLIFE.NS", "HINDALCO.NS", "HINDUNILVR.NS", "ITC.NS",
+        "INDIGO.NS", "JSWSTEEL.NS", "JIOFIN.NS", "KOTAKBANK.NS",
+        "MARUTI.NS", "MAXHEALTH.NS", "NTPC.NS", "NESTLEIND.NS",
+        "ONGC.NS", "POWERGRID.NS", "SBILIFE.NS", "SHRIRAMFIN.NS",
+        "SUNPHARMA.NS", "TCS.NS", "TATACONSUM.NS", "TMPV.NS",
+        "TATASTEEL.NS", "TECHM.NS", "TITAN.NS", "TRENT.NS",
+        "ULTRACEMCO.NS", "WIPRO.NS"
+    ]
 
         print("Fetching data (batch)...")
 
