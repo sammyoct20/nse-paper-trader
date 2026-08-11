@@ -80,13 +80,15 @@ class PaperEngine:
 
     # ---------------- MARKET FILTER ---------------- #
     def is_market_bullish(self):
-        df = yf.download("^NSEI", period="5d", interval="15m", progress=False)
+        df = yf.download("^NSEI", period="5d", interval="15m",
+                         auto_adjust=False, progress=False)
 
         if df.empty:
             return False
 
         df["EMA50"] = df["Close"].ewm(span=50).mean()
-        return float(df["Close"].iloc[-1]) > float(df["EMA50"].iloc[-1])
+
+        return float(df["Close"].iloc[-1].item()) > float(df["EMA50"].iloc[-1].item())
 
     # ---------------- SCAN ---------------- #
     def scan_market(self):
@@ -102,6 +104,7 @@ class PaperEngine:
             period="5d",
             interval="15m",
             group_by="ticker",
+            auto_adjust=False,
             threads=True
         )
 
@@ -125,8 +128,8 @@ class PaperEngine:
                 if trend and momentum and breakout and volume:
                     signals.append({
                         "symbol": sym,
-                        "price": float(last["Close"]),
-                        "atr": float(last["ATR"])
+                        "price": float(last["Close"].item()),
+                        "atr": float(last["ATR"].item())
                     })
 
             except Exception as e:
@@ -202,12 +205,13 @@ class PaperEngine:
             trade_id, sym, entry, sl, target, qty = r
 
             try:
-                df = yf.download(sym, period="1d", interval="5m", progress=False)
+                df = yf.download(sym, period="1d", interval="5m",
+                                 auto_adjust=False, progress=False)
 
                 if df.empty:
                     continue
 
-                price = float(df["Close"].iloc[-1])
+                price = float(df["Close"].iloc[-1].item())
 
                 if price <= sl or price >= target:
                     pnl = (price - entry) * qty
@@ -223,3 +227,15 @@ class PaperEngine:
 
         self.conn.commit()
         cur.close()
+
+    # ---------------- WORKER SUPPORT ---------------- #
+    def run_once(self):
+        print("=== ENGINE START ===")
+
+        signals = self.scan_market()
+        trades = self.generate_trades(signals)
+
+        self.save_trades(trades)
+        self.update_trades()
+
+        print("=== ENGINE END ===")
