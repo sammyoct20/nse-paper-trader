@@ -1,5 +1,5 @@
-import pandas as pd
 import yfinance as yf
+import pandas as pd
 import psycopg2
 import os
 from datetime import datetime
@@ -7,13 +7,24 @@ from datetime import datetime
 class PaperEngine:
 
     def __init__(self):
-        self.conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        self.db_url = os.getenv("DATABASE_URL")
+        self.conn = psycopg2.connect(self.db_url)
         self.create_tables()
 
-        self.total_capital = 100000
+        # config
+        self.capital = 100000
         self.max_trades = 3
+        self.risk_per_trade = 0.01  # 1%
 
-    # ---------------- DB ---------------- #
+        # Nifty 50 sample (you can expand)
+        self.symbols = [
+            "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS",
+            "INFY.NS", "TCS.NS", "LT.NS"
+        ]
+
+    # -----------------------------
+    # DB TABLES
+    # -----------------------------
     def create_tables(self):
         cur = self.conn.cursor()
 
@@ -26,7 +37,7 @@ class PaperEngine:
             target FLOAT,
             qty INT,
             status TEXT,
-            pnl FLOAT DEFAULT 0,
+            pnl FLOAT,
             exit_reason TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             exit_time TIMESTAMP
@@ -36,209 +47,147 @@ class PaperEngine:
         self.conn.commit()
         cur.close()
 
-    # ---------------- STOCK LIST ---------------- #
-    def get_nifty50(self):
-        return [
-            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
-            "SBIN.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LT.NS",
-            "HCLTECH.NS","AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS","SUNPHARMA.NS"
-        ]
+    # -----------------------------
+    # FETCH PRICE
+    # -----------------------------
+    def get_price(self, sym):
+        try:
+            df = yf.download(sym, period="1d", interval="5m", progress=False)
+            if df.empty:
+                return None
+            return float(df["Close"].iloc[-1])
+        except:
+            return None
 
-    # ---------------- INDICATORS ---------------- #
-    def add_indicators(self, df):
-        df["EMA20"] = df["Close"].ewm(span=20).mean()
-        df["EMA50"] = df["Close"].ewm(span=50).mean()
-        df["EMA200"] = df["Close"].ewm(span=200).mean()
+    # -----------------------------
+    # STRATEGY
+    # -----------------------------
+    def generate_signal(self, sym):
 
-        delta = df["Close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df["RSI"] = 100 - (100 / (1 + rs))
+        df = yf.download(sym, period="5d", interval="15m", progress=False)
+        if df.empty or len(df) < 20:
+            return None
 
-        df["VOL_AVG"] = df["Volume"].rolling(20).mean()
-        df["HH"] = df["High"].rolling(20).max()
+        df["ema20"] = df["Close"].ewm(span=20).mean()
+        df["ema50"] = df["Close"].ewm(span=50).mean()
 
-        return df
+        latest = df.iloc[-1]
 
-    # ---------------- SCORING ---------------- #
-    def score_stock(self, df):
-        last = df.iloc[-1]
-        score = 0
+        if latest["Close"] > latest["ema20"] > latest["ema50"]:
+            return "BUY"
 
-        if last["Close"] > last["EMA50"]:
-            score += 2
-        if last["EMA50"] > last["EMA200"]:
-            score += 2
-        if 55 < last["RSI"] < 70:
-            score += 1
-        if last["Volume"] > 1.2 * last["VOL_AVG"]:
-            score += 2
-        if last["Close"] > df["HH"].iloc[-2]:
-            score += 3
+        return None
 
-        return score
-
-    # ---------------- SCAN ---------------- #
-    def scan_market(self):
-        symbols = self.get_nifty50()
-
-        df_all = yf.download(
-            tickers=" ".join(symbols),
-            period="5d",
-            interval="15m",
-            group_by="ticker",
-            auto_adjust=False,
-            threads=True
-        )
-
-        scored = []
-
-        for sym in symbols:
-            try:
-                df = df_all[sym]
-
-                if df.empty or len(df) < 50:
-                    continue
-
-                df = self.add_indicators(df)
-                score = self.score_stock(df)
-
-                if score >= 6:
-                    price = float(df["Close"].iloc[-1])
-                    scored.append((sym, price, score))
-
-            except:
-                continue
-
-        scored.sort(key=lambda x: x[2], reverse=True)
-        return scored
-
-    # ---------------- GENERATE TRADES ---------------- #
-    def generate_trades(self, signals):
-
+    # -----------------------------
+    # OPEN TRADES COUNT
+    # -----------------------------
+    def open_trades_count(self):
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'")
-        open_count = cur.fetchone()[0]
+        count = cur.fetchone()[0]
         cur.close()
+        return count
 
-        slots = self.max_trades - open_count
+    # -----------------------------
+    # CREATE TRADE
+    # -----------------------------
+    def create_trade(self, sym, price):
 
-        if slots <= 0:
-            return []
+        stop_loss = price * 0.99
+        target = price * 1.02
 
-        signals = signals[:slots]
+        risk_amt = self.capital * self.risk_per_trade
+        qty = int(risk_amt / (price - stop_loss))
 
-        capital_per_trade = self.total_capital / self.max_trades
-
-        trades = []
-
-        for sym, price, score in signals:
-
-            stop_loss = price * 0.98
-            target = price * 1.03
-            qty = int(capital_per_trade / price)
-
-            trades.append({
-                "symbol": sym,
-                "entry": round(price, 2),
-                "stop_loss": round(stop_loss, 2),
-                "target": round(target, 2),
-                "qty": qty,
-                "status": "OPEN"
-            })
-
-        return trades
-
-    # ---------------- SAVE ---------------- #
-    def save_trades(self, trades):
-        cur = self.conn.cursor()
-
-        for t in trades:
-
-            cur.execute("""
-            SELECT COUNT(*) FROM trades
-            WHERE symbol=%s AND status='OPEN'
-            """, (t["symbol"],))
-
-            if cur.fetchone()[0] > 0:
-                continue
-
-            cur.execute("""
-            INSERT INTO trades (symbol, entry, stop_loss, target, qty, status)
-            VALUES (%s,%s,%s,%s,%s,%s)
-            """, (
-                t["symbol"], t["entry"], t["stop_loss"],
-                t["target"], t["qty"], t["status"]
-            ))
-
-        self.conn.commit()
-        cur.close()
-
-    # ---------------- UPDATE TRADES (FIXED) ---------------- #
-    def update_trades(self):
         cur = self.conn.cursor()
 
         cur.execute("""
-        SELECT id, symbol, entry, stop_loss, target, qty
-        FROM trades WHERE status='OPEN'
-        """)
-
-        rows = cur.fetchall()
-
-        for r in rows:
-            trade_id, sym, entry, sl, target, qty = r
-
-            try:
-                df = yf.download(
-                    sym,
-                    period="1d",
-                    interval="5m",
-                    auto_adjust=False,
-                    progress=False
-                )
-
-                if df.empty:
-                    continue
-
-                low = float(df["Low"].iloc[-1])
-                high = float(df["High"].iloc[-1])
-
-                exit_price = None
-                exit_reason = None
-
-                # SL HIT
-                if low <= sl:
-                    exit_price = sl
-                    exit_reason = "STOP LOSS HIT"
-
-                # TARGET HIT
-                elif high >= target:
-                    exit_price = target
-                    exit_reason = "TARGET HIT"
-
-                if exit_price:
-                    pnl = (exit_price - entry) * qty
-
-                    cur.execute("""
-                    UPDATE trades
-                    SET status='CLOSED',
-                        pnl=%s,
-                        exit_time=%s,
-                        exit_reason=%s
-                    WHERE id=%s
-                    """, (pnl, datetime.now(), exit_reason, trade_id))
-
-            except:
-                continue
+        INSERT INTO trades (symbol, entry, stop_loss, target, qty, status, pnl)
+        VALUES (%s,%s,%s,%s,%s,'OPEN',0)
+        """, (sym, price, stop_loss, target, qty))
 
         self.conn.commit()
         cur.close()
 
-    # ---------------- MAIN ---------------- #
-    def run_once(self):
-        signals = self.scan_market()
-        trades = self.generate_trades(signals)
+    # -----------------------------
+    # UPDATE TRADES (AUTO CLOSE)
+    # -----------------------------
+    def update_trades(self):
 
-        self.save_trades(trades)
+        cur = self.conn.cursor()
+
+        cur.execute("SELECT id, symbol, entry, stop_loss, target, qty FROM trades WHERE status='OPEN'")
+        trades = cur.fetchall()
+
+        for t in trades:
+            trade_id, sym, entry, sl, tgt, qty = t
+
+            price = self.get_price(sym)
+            if price is None:
+                continue
+
+            exit_reason = None
+
+            if price <= sl:
+                exit_reason = "STOP LOSS HIT"
+
+            elif price >= tgt:
+                exit_reason = "TARGET HIT"
+
+            if exit_reason:
+                pnl = (price - entry) * qty
+
+                print(f"Closing {sym} | {exit_reason}")
+
+                cur.execute("""
+                UPDATE trades
+                SET status='CLOSED',
+                    pnl=%s,
+                    exit_reason=%s,
+                    exit_time=%s
+                WHERE id=%s
+                """, (pnl, exit_reason, datetime.now(), trade_id))
+
+        self.conn.commit()
+        cur.close()
+
+    # -----------------------------
+    # MAIN RUN
+    # -----------------------------
+    def run_once(self):
+
         self.update_trades()
+
+        trades_open = self.open_trades_count()
+
+        signals = 0
+        trades_created = 0
+
+        for sym in self.symbols:
+
+            if trades_open >= self.max_trades:
+                break
+
+            signal = self.generate_signal(sym)
+
+            if signal == "BUY":
+                price = self.get_price(sym)
+                if price is None:
+                    continue
+
+                self.create_trade(sym, price)
+
+                signals += 1
+                trades_created += 1
+                trades_open += 1
+
+        # DEBUG
+        cur = self.conn.cursor()
+        cur.execute("SELECT symbol, status, pnl, exit_reason FROM trades")
+        rows = cur.fetchall()
+        print("==== DB DATA ====")
+        for r in rows:
+            print(r)
+        cur.close()
+
+        return signals, trades_created
