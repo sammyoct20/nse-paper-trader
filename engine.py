@@ -15,8 +15,22 @@ class PaperEngine:
         self.capital = 100000
         self.risk_per_trade = 0.01
 
-    # ---------------- DB ---------------- #
+    # ---------------- NIFTY 50 ---------------- #
+    def get_nifty50(self):
+        return [
+            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
+            "SBIN.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LT.NS",
+            "HCLTECH.NS","AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS","SUNPHARMA.NS",
+            "ULTRACEMCO.NS","TITAN.NS","BAJFINANCE.NS","BAJAJFINSV.NS","WIPRO.NS",
+            "NESTLEIND.NS","HINDUNILVR.NS","POWERGRID.NS","NTPC.NS","ONGC.NS",
+            "COALINDIA.NS","TATASTEEL.NS","JSWSTEEL.NS","GRASIM.NS","ADANIENT.NS",
+            "ADANIPORTS.NS","APOLLOHOSP.NS","BRITANNIA.NS","CIPLA.NS","DIVISLAB.NS",
+            "DRREDDY.NS","EICHERMOT.NS","HEROMOTOCO.NS","INDUSINDBK.NS","BAJAJ-AUTO.NS",
+            "M&M.NS","SHRIRAMFIN.NS","TATACONSUM.NS","TECHM.NS","UPL.NS",
+            "HDFCLIFE.NS","SBILIFE.NS","ICICIPRULI.NS","HAVELLS.NS","PIDILITIND.NS"
+        ]
 
+    # ---------------- DB ---------------- #
     def create_tables(self):
         cur = self.conn.cursor()
 
@@ -38,29 +52,52 @@ class PaperEngine:
         self.conn.commit()
         cur.close()
 
-    # ---------------- SCAN (FAST) ---------------- #
+    # ---------------- INDICATORS ---------------- #
+    def add_indicators(self, df):
 
+        df["EMA20"] = df["Close"].ewm(span=20).mean()
+        df["EMA50"] = df["Close"].ewm(span=50).mean()
+        df["EMA200"] = df["Close"].ewm(span=200).mean()
+
+        delta = df["Close"].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df["RSI"] = 100 - (100 / (1 + rs))
+
+        df["VOL_AVG"] = df["Volume"].rolling(20).mean()
+        df["HH"] = df["High"].rolling(20).max()
+
+        df["TR"] = df[["High","Low","Close"]].apply(
+            lambda x: max(x["High"]-x["Low"],
+                          abs(x["High"]-x["Close"]),
+                          abs(x["Low"]-x["Close"])),
+            axis=1
+        )
+        df["ATR"] = df["TR"].rolling(14).mean()
+
+        return df
+
+    # ---------------- MARKET FILTER ---------------- #
+    def is_market_bullish(self):
+        df = yf.download("^NSEI", period="5d", interval="15m", progress=False)
+
+        if df.empty:
+            return False
+
+        df["EMA50"] = df["Close"].ewm(span=50).mean()
+        return float(df["Close"].iloc[-1]) > float(df["EMA50"].iloc[-1])
+
+    # ---------------- SCAN ---------------- #
     def scan_market(self):
 
-    symbols = [
-        "HDFCBANK.NS", "ICICIBANK.NS", "RELIANCE.NS", "BHARTIARTL.NS",
-        "LT.NS", "SBIN.NS", "INFY.NS", "AXISBANK.NS",
-        "BAJFINANCE.NS", "M&M.NS", "ADANIENT.NS", "ADANIPORTS.NS",
-        "APOLLOHOSP.NS", "ASIANPAINT.NS", "BAJAJ-AUTO.NS", "BAJAJFINSV.NS",
-        "BEL.NS", "CIPLA.NS", "COALINDIA.NS", "DRREDDY.NS",
-        "EICHERMOT.NS", "ETERNAL.NS", "GRASIM.NS", "HCLTECH.NS",
-        "HDFCLIFE.NS", "HINDALCO.NS", "HINDUNILVR.NS", "ITC.NS",
-        "INDIGO.NS", "JSWSTEEL.NS", "JIOFIN.NS", "KOTAKBANK.NS",
-        "MARUTI.NS", "MAXHEALTH.NS", "NTPC.NS", "NESTLEIND.NS",
-        "ONGC.NS", "POWERGRID.NS", "SBILIFE.NS", "SHRIRAMFIN.NS",
-        "SUNPHARMA.NS", "TCS.NS", "TATACONSUM.NS", "TMPV.NS",
-        "TATASTEEL.NS", "TECHM.NS", "TITAN.NS", "TRENT.NS",
-        "ULTRACEMCO.NS", "WIPRO.NS"
-    ]
+        symbols = self.get_nifty50()
 
-        print("Fetching data (batch)...")
+        if not self.is_market_bullish():
+            print("Market not bullish")
+            return []
 
-        df = yf.download(
+        df_all = yf.download(
             tickers=" ".join(symbols),
             period="5d",
             interval="15m",
@@ -72,43 +109,48 @@ class PaperEngine:
 
         for sym in symbols:
             try:
-                data = df[sym]
+                df = df_all[sym]
 
-                if data.empty or len(data) < 30:
+                if df.empty or len(df) < 50:
                     continue
 
-                close = float(data["Close"].iloc[-1])
-                ema20 = data["Close"].ewm(span=20).mean().iloc[-1]
+                df = self.add_indicators(df)
+                last = df.iloc[-1]
 
-                recent_high = data["High"].rolling(20).max().iloc[-2]
+                trend = last["Close"] > last["EMA50"] > last["EMA200"]
+                momentum = 55 < last["RSI"] < 70
+                breakout = last["Close"] > df["HH"].iloc[-2] * 0.995
+                volume = last["Volume"] > 1.2 * last["VOL_AVG"]
 
-                # ✅ Better signal: trend + breakout
-                if close > ema20 and close > recent_high:
-
+                if trend and momentum and breakout and volume:
                     signals.append({
                         "symbol": sym,
-                        "price": close
+                        "price": float(last["Close"]),
+                        "atr": float(last["ATR"])
                     })
 
             except Exception as e:
-                print(f"{sym} error:", e)
+                print(sym, e)
 
         return signals
 
     # ---------------- TRADE ---------------- #
-
     def generate_trades(self, signals):
 
         trades = []
 
         for s in signals:
             entry = s["price"]
+            atr = s["atr"]
 
-            sl = entry * 0.99
-            target = entry * 1.02
+            sl = entry - (1.5 * atr)
+            target = entry + (2 * atr)
 
             risk = entry - sl
-            qty = int((self.capital * self.risk_per_trade) / risk) if risk > 0 else 0
+            if risk <= 0:
+                continue
+
+            qty = int((self.capital * self.risk_per_trade) / risk)
 
             trades.append({
                 "symbol": s["symbol"],
@@ -122,13 +164,10 @@ class PaperEngine:
         return trades
 
     # ---------------- SAVE ---------------- #
-
     def save_trades(self, trades):
-
         cur = self.conn.cursor()
 
         for t in trades:
-
             cur.execute("""
             SELECT COUNT(*) FROM trades
             WHERE symbol=%s AND status='OPEN'
@@ -149,9 +188,7 @@ class PaperEngine:
         cur.close()
 
     # ---------------- UPDATE ---------------- #
-
     def update_trades(self):
-
         cur = self.conn.cursor()
 
         cur.execute("""
@@ -173,7 +210,6 @@ class PaperEngine:
                 price = float(df["Close"].iloc[-1])
 
                 if price <= sl or price >= target:
-
                     pnl = (price - entry) * qty
 
                     cur.execute("""
@@ -187,20 +223,3 @@ class PaperEngine:
 
         self.conn.commit()
         cur.close()
-
-    # ---------------- RUN ---------------- #
-
-    def run_once(self):
-
-        print("=== ENGINE START ===")
-
-        signals = self.scan_market()
-        print("Signals:", len(signals))
-
-        trades = self.generate_trades(signals)
-        print("Trades:", len(trades))
-
-        self.save_trades(trades)
-        self.update_trades()
-
-        print("=== ENGINE END ===")
