@@ -12,7 +12,6 @@ class PaperEngine:
 
         self.total_capital = 100000
         self.max_trades = 3
-        self.risk_per_trade = 0.01
 
     # ---------------- DB ---------------- #
     def create_tables(self):
@@ -105,33 +104,31 @@ class PaperEngine:
 
                 score = self.score_stock(df)
 
-                if score >= 6:   # threshold filter
+                if score >= 6:
                     price = float(df["Close"].iloc[-1])
                     scored.append((sym, price, score))
 
             except:
                 continue
 
-        # Sort by strongest setups
         scored.sort(key=lambda x: x[2], reverse=True)
 
         return scored
 
-    # ---------------- POSITION SIZING ---------------- #
+    # ---------------- GENERATE TRADES ---------------- #
     def generate_trades(self, signals):
 
-        # Check open trades
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'")
         open_count = cur.fetchone()[0]
         cur.close()
 
-        slots_available = self.max_trades - open_count
+        slots = self.max_trades - open_count
 
-        if slots_available <= 0:
+        if slots <= 0:
             return []
 
-        signals = signals[:slots_available]
+        signals = signals[:slots]
 
         capital_per_trade = self.total_capital / self.max_trades
 
@@ -139,15 +136,9 @@ class PaperEngine:
 
         for sym, price, score in signals:
 
-            stop_loss = price * 0.98   # 2% SL
-            target = price * 1.03      # 3% target
-
-            risk = price - stop_loss
+            stop_loss = price * 0.98
+            target = price * 1.03
             qty = int(capital_per_trade / price)
-
-            # Smart entry: avoid weak candles
-            if price < price * 0.995:
-                continue
 
             trades.append({
                 "symbol": sym,
@@ -185,7 +176,7 @@ class PaperEngine:
         self.conn.commit()
         cur.close()
 
-    # ---------------- UPDATE ---------------- #
+    # ---------------- UPDATE (FIXED SL LOGIC) ---------------- #
     def update_trades(self):
         cur = self.conn.cursor()
 
@@ -200,16 +191,32 @@ class PaperEngine:
             trade_id, sym, entry, sl, target, qty = r
 
             try:
-                df = yf.download(sym, period="1d", interval="5m",
-                                 auto_adjust=False, progress=False)
+                df = yf.download(
+                    sym,
+                    period="1d",
+                    interval="5m",
+                    auto_adjust=False,
+                    progress=False
+                )
 
                 if df.empty:
                     continue
 
-                price = float(df["Close"].iloc[-1])
+                low = float(df["Low"].iloc[-1])
+                high = float(df["High"].iloc[-1])
 
-                if price <= sl or price >= target:
-                    pnl = (price - entry) * qty
+                exit_price = None
+
+                # SL HIT (intra candle)
+                if low <= sl:
+                    exit_price = sl
+
+                # TARGET HIT
+                elif high >= target:
+                    exit_price = target
+
+                if exit_price:
+                    pnl = (exit_price - entry) * qty
 
                     cur.execute("""
                     UPDATE trades
