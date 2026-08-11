@@ -2,53 +2,123 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 import os
+from datetime import datetime
 from engine import PaperEngine
 
-st.set_page_config(layout="wide")
+# ---------------- PAGE CONFIG ---------------- #
+st.set_page_config(page_title="Trading Dashboard", layout="wide")
+
 st.title("📊 Trading Dashboard")
 
-# ---------------- DB ---------------- #
+# ---------------- DB CONNECTION ---------------- #
 @st.cache_resource
 def get_connection():
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
 conn = get_connection()
 
-# ---------------- UI ---------------- #
-st.write("UI loaded")
+# ---------------- ENGINE ---------------- #
+engine = PaperEngine()
 
-if st.button("Run Scanner Now"):
-    try:
-        st.write("Running scanner...")
+# ---------------- HEADER ---------------- #
+col1, col2 = st.columns([3, 1])
 
-        engine = PaperEngine()
+with col1:
+    st.write("Smart Swing Trading System")
 
+with col2:
+    if "last_run" in st.session_state:
+        st.caption(f"Last run: {st.session_state['last_run']}")
+    else:
+        st.caption("Last run: Never")
+
+# ---------------- RUN SCANNER ---------------- #
+if st.button("🚀 Run Scanner Now"):
+
+    with st.spinner("Scanning market... please wait"):
         signals = engine.scan_market()
-        st.write(f"Signals: {len(signals)}")
-
         trades = engine.generate_trades(signals)
-        st.write(f"Trades generated: {len(trades)}")
-
         engine.save_trades(trades)
-        st.write("Trades saved")
-
         engine.update_trades()
-        st.write("Trades updated")
 
-        st.success("Done")
+        st.session_state["last_run"] = datetime.now().strftime("%d-%b %H:%M:%S")
 
-    except Exception as e:
-        st.error(f"Error: {e}")
+    st.success(f"Scan complete | Signals: {len(signals)} | Trades: {len(trades)}")
 
-# ---------------- DATA ---------------- #
-try:
-    df = pd.read_sql("SELECT * FROM trades ORDER BY created_at DESC", conn)
-except Exception as e:
-    st.error(f"DB Error: {e}")
-    st.stop()
+# ---------------- LOAD DATA ---------------- #
+def load_trades():
+    try:
+        df = pd.read_sql("""
+            SELECT * FROM trades 
+            ORDER BY created_at DESC
+        """, conn)
+        return df
+    except:
+        return pd.DataFrame()
 
-if df.empty:
-    st.warning("No trades yet")
-    st.stop()
+df = load_trades()
 
-st.dataframe(df, use_container_width=True)
+# ---------------- TABS ---------------- #
+tab1, tab2, tab3 = st.tabs(["📈 Open Trades", "📊 Closed Trades", "📉 Analytics"])
+
+# ---------------- OPEN TRADES ---------------- #
+with tab1:
+
+    st.subheader("Open Trades")
+
+    if df.empty:
+        st.info("No trades yet")
+    else:
+        open_df = df[df["status"] == "OPEN"]
+
+        if open_df.empty:
+            st.info("No open trades")
+        else:
+            st.dataframe(open_df, use_container_width=True)
+
+# ---------------- CLOSED TRADES ---------------- #
+with tab2:
+
+    st.subheader("Closed Trades")
+
+    if df.empty:
+        st.info("No trades yet")
+    else:
+        closed_df = df[df["status"] == "CLOSED"]
+
+        if closed_df.empty:
+            st.info("No closed trades yet")
+        else:
+            st.dataframe(closed_df, use_container_width=True)
+
+# ---------------- ANALYTICS ---------------- #
+with tab3:
+
+    st.subheader("Performance Analytics")
+
+    if df.empty:
+        st.info("No data yet")
+    else:
+        closed_df = df[df["status"] == "CLOSED"]
+
+        if closed_df.empty:
+            st.warning("No closed trades to analyze")
+        else:
+            total_trades = len(closed_df)
+            wins = len(closed_df[closed_df["pnl"] > 0])
+            losses = len(closed_df[closed_df["pnl"] <= 0])
+
+            win_rate = round((wins / total_trades) * 100, 2)
+            total_pnl = closed_df["pnl"].sum()
+
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric("Total Trades", total_trades)
+            col2.metric("Win Rate", f"{win_rate}%")
+            col3.metric("Total PnL", round(total_pnl, 2))
+
+            # Equity Curve
+            closed_df = closed_df.sort_values("exit_time")
+            closed_df["equity"] = closed_df["pnl"].cumsum()
+
+            st.line_chart(closed_df["equity"])
