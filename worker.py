@@ -1,24 +1,37 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
 from engine import PaperEngine
+import datetime
 
-n = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-print("Current IST time:", n)
+def main():
 
-is_market_open = (
-    n.weekday() < 5 and (
-        (n.hour == 9 and n.minute >= 15) or 
-        10 <= n.hour <= 14 or 
-        (n.hour == 15 and n.minute <= 35)
-    )
-)
+    print("\n==============================")
+    print("🚀 Worker Started")
+    print("==============================\n")
 
-print("Market open:", is_market_open)
+    engine = PaperEngine()
 
-if is_market_open:
-    print("Starting scanner...")
-    PaperEngine().run_once()
-    print("Scanner finished")
-else:
-    print("Outside NSE market hours")
+    trades = engine.run_once()
+
+    print(f"🕒 Time: {datetime.datetime.now()}")
+    print(f"📊 Trades Found: {len(trades)}\n")
+
+    if not trades:
+        print("❌ No trades today (market not favorable)\n")
+        return
+
+    print("🔥 Trades:\n")
+
+    for t in trades:
+        print(f"""
+Symbol: {t['symbol']}
+Entry: {t['entry']}
+SL: {t['sl']}
+Target: {t['target']}
+RR: {t['rr']}
+Score: {t['score']}
+---------------------------
+""")
+
+
+if __name__ == "__main__":
+    main()
