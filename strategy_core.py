@@ -23,6 +23,14 @@ class StrategyConfig:
     ema_fast: int = 20
     ema_slow: int = 50
 
+    # Cost-awareness: reject trades whose target payout is too thin to be
+    # worth a slot once real-world friction (brokerage + STT + slippage) is
+    # accounted for. round_trip_cost_pct is a rough all-in estimate applied
+    # to notional value; min_net_reward is an absolute rupee floor so a trade
+    # can't sneak through on a cheap/high-qty stock with a wafer-thin edge.
+    round_trip_cost_pct: float = 0.0015   # ~0.15% of notional, both legs combined
+    min_net_reward: float = 150.0         # rupees, after estimated costs
+
 
 def rsi(close: pd.Series, period: int) -> pd.Series:
     delta = close.diff()
@@ -113,9 +121,22 @@ def evaluate_row(df: pd.DataFrame, i: int, cfg: StrategyConfig, capital_for_sizi
     if qty < 1:
         return None
 
+    # cost-aware filter: is this trade actually worth a slot once friction
+    # is accounted for? qty is very often capital-capped rather than
+    # risk-capped on high-priced/low-volatility names, which can produce a
+    # "correct" 2:1 R:R trade whose absolute payout barely covers costs.
+    notional = price * qty
+    estimated_cost = notional * cfg.round_trip_cost_pct
+    reward_at_target = (target - price) * qty
+    net_reward = reward_at_target - estimated_cost
+
+    if net_reward < cfg.min_net_reward:
+        return None
+
     return {
         "entry": round(price, 2),
         "stop_loss": round(stop_loss, 2),
         "target": round(target, 2),
         "qty": qty,
+        "est_net_reward": round(net_reward, 2),
     }

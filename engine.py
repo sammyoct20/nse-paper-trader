@@ -37,6 +37,8 @@ class PaperEngine:
             rsi_min=float(os.getenv("RSI_MIN", 30)),
             rsi_max=float(os.getenv("RSI_MAX", 70)),
             min_price=float(os.getenv("MIN_PRICE", 20)),
+            round_trip_cost_pct=float(os.getenv("ROUND_TRIP_COST_PCT", 0.0015)),
+            min_net_reward=float(os.getenv("MIN_NET_REWARD", 150.0)),
         )
         self.max_retries = int(os.getenv("FETCH_RETRIES", 2))
 
