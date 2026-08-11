@@ -23,7 +23,7 @@ if st.button("🚀 Run Scanner Now"):
 # ---------------------------
 # LOAD DATA
 # ---------------------------
-df = pd.read_sql("SELECT * FROM trades ORDER BY entry_time DESC", conn)
+df = pd.read_sql("SELECT * FROM trades ORDER BY created_at DESC", conn)
 
 # ---------------------------
 # TABS

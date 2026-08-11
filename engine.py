@@ -4,8 +4,7 @@ import psycopg2
 import os
 import time
 import logging
-
-from strategy_core import StrategyConfig, compute_indicators, evaluate_row
+from datetime import datetime, timezone
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,22 +23,17 @@ class PaperEngine:
         self.conn = None
         self._connect_db()
 
-        # ---- strategy config (env-overridable) ----
-        self.cfg = StrategyConfig(
-            capital=float(os.getenv("CAPITAL", 100000)),
-            max_trades=int(os.getenv("MAX_TRADES", 3)),
-            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", 0.01)),
-            atr_period=int(os.getenv("ATR_PERIOD", 14)),
-            atr_stop_mult=float(os.getenv("ATR_STOP_MULT", 1.5)),
-            atr_target_mult=float(os.getenv("ATR_TARGET_MULT", 3.0)),
-            volume_mult=float(os.getenv("VOLUME_MULT", 1.5)),
-            rsi_period=int(os.getenv("RSI_PERIOD", 14)),
-            rsi_min=float(os.getenv("RSI_MIN", 30)),
-            rsi_max=float(os.getenv("RSI_MAX", 70)),
-            min_price=float(os.getenv("MIN_PRICE", 20)),
-            round_trip_cost_pct=float(os.getenv("ROUND_TRIP_COST_PCT", 0.0015)),
-            min_net_reward=float(os.getenv("MIN_NET_REWARD", 150.0)),
-        )
+        # ---- config (env-overridable so you can tune without code changes) ----
+        self.capital = float(os.getenv("CAPITAL", 100000))
+        self.max_trades = int(os.getenv("MAX_TRADES", 3))
+        self.risk_per_trade_pct = float(os.getenv("RISK_PER_TRADE_PCT", 0.01))  # 1% of capital risked per trade
+        self.atr_period = int(os.getenv("ATR_PERIOD", 14))
+        self.atr_stop_mult = float(os.getenv("ATR_STOP_MULT", 1.5))
+        self.atr_target_mult = float(os.getenv("ATR_TARGET_MULT", 3.0))  # ~2:1 reward:risk
+        self.volume_mult = float(os.getenv("VOLUME_MULT", 1.5))
+        self.rsi_period = int(os.getenv("RSI_PERIOD", 14))
+        self.rsi_max = float(os.getenv("RSI_MAX", 70))  # avoid chasing overbought breakouts
+        self.min_price = float(os.getenv("MIN_PRICE", 20))  # skip illiquid penny-priced names
         self.max_retries = int(os.getenv("FETCH_RETRIES", 2))
 
         # Nifty stocks (you can expand later)
@@ -93,6 +87,7 @@ class PaperEngine:
         );
         """)
 
+        # Ensure missing columns (safe updates)
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_time TIMESTAMP;")
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT;")
@@ -100,6 +95,7 @@ class PaperEngine:
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'OPEN';")
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_loss FLOAT;")
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS target FLOAT;")
+        # index to make the duplicate-position check and open-trade lookups fast
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_status_symbol ON trades(status, symbol);")
 
         self.conn.commit()
@@ -119,6 +115,8 @@ class PaperEngine:
                 if df is None or df.empty:
                     return None
 
+                # yfinance sometimes returns MultiIndex columns (e.g. ('Close','RELIANCE.NS'))
+                # even for a single symbol depending on version - flatten to plain columns.
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
 
@@ -129,7 +127,7 @@ class PaperEngine:
 
                 df = df.dropna(subset=["Close", "Volume"])
 
-                if len(df) < max(self.cfg.atr_period, self.cfg.ema_slow) + 2:
+                if len(df) < max(self.atr_period, 50) + 2:
                     return None
 
                 return df
@@ -141,9 +139,35 @@ class PaperEngine:
         return None
 
     # ----------------------------------
-    # STRATEGY (delegates to strategy.py so live + backtest never drift)
+    # INDICATORS
+    # ----------------------------------
+    @staticmethod
+    def _rsi(close: pd.Series, period: int) -> pd.Series:
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
+        avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
+        rs = avg_gain / avg_loss.replace(0, float("nan"))
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50)
+
+    @staticmethod
+    def _atr(df: pd.DataFrame, period: int) -> pd.Series:
+        high, low, close = df["High"], df["Low"], df["Close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        return tr.ewm(span=period, min_periods=period).mean()
+
+    # ----------------------------------
+    # STRATEGY (trend + momentum + volatility-aware sizing)
     # ----------------------------------
     def generate_signal(self, sym, open_symbols):
+        # never open a second position in a symbol we already hold
         if sym in open_symbols:
             return None
 
@@ -151,13 +175,69 @@ class PaperEngine:
         if df is None:
             return None
 
-        df = compute_indicators(df, self.cfg)
-        sig = evaluate_row(df, len(df) - 1, self.cfg, capital_for_sizing=self.cfg.capital)
-        if sig is None:
+        df["ema20"] = df["Close"].ewm(span=20, min_periods=20).mean()
+        df["ema50"] = df["Close"].ewm(span=50, min_periods=50).mean()
+        df["rsi"] = self._rsi(df["Close"], self.rsi_period)
+        df["atr"] = self._atr(df, self.atr_period)
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        price = float(latest["Close"])
+        ema20 = float(latest["ema20"])
+        ema50 = float(latest["ema50"])
+        rsi = float(latest["rsi"])
+        atr = float(latest["atr"])
+        volume = float(latest["Volume"])
+        avg_volume = float(df["Volume"].tail(20).mean())
+
+        if pd.isna(ema20) or pd.isna(ema50) or pd.isna(atr) or atr <= 0:
             return None
 
-        sig["symbol"] = sym
-        return sig
+        if price < self.min_price:
+            return None
+
+        # trend filter: price above both EMAs, EMAs stacked in bullish order
+        if not (price > ema20 > ema50):
+            return None
+
+        # momentum confirmation, but avoid entries already deep into overbought territory
+        if not (30 < rsi < self.rsi_max):
+            return None
+
+        # volume confirmation: this move has real participation
+        if avg_volume <= 0 or volume < self.volume_mult * avg_volume:
+            return None
+
+        # breakout confirmation vs prior candle
+        if price <= float(prev["High"]):
+            return None
+
+        stop_loss = price - self.atr_stop_mult * atr
+        target = price + self.atr_target_mult * atr
+
+        if stop_loss <= 0 or stop_loss >= price:
+            return None
+
+        # position size from risk budget, not just capital / N
+        risk_amount = self.capital * self.risk_per_trade_pct
+        risk_per_share = price - stop_loss
+        qty_by_risk = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
+
+        # cap by an equal per-slot capital allocation too, so one trade can't eat the whole book
+        qty_by_capital = int((self.capital / self.max_trades) / price)
+
+        qty = max(0, min(qty_by_risk, qty_by_capital))
+        if qty < 1:
+            return None
+
+        return {
+            "symbol": sym,
+            "entry": round(price, 2),
+            "stop_loss": round(stop_loss, 2),
+            "target": round(target, 2),
+            "qty": qty,
+        }
 
     # ----------------------------------
     # SAVE TRADE
@@ -248,7 +328,7 @@ class PaperEngine:
 
         open_trades = self.get_open_trades()
         open_symbols = {t[1] for t in open_trades}
-        slots = self.cfg.max_trades - len(open_trades)
+        slots = self.max_trades - len(open_trades)
 
         if slots <= 0:
             log.info("No free slots, skipping new entries this cycle")
