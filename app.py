@@ -1,58 +1,37 @@
 import streamlit as st
 import pandas as pd
-import psycopg2
-import os
 from engine import PaperEngine
 
-st.set_page_config(page_title="Trading Dashboard", layout="wide")
+st.set_page_config(page_title="Swing Scanner", layout="wide")
 
-st.title("📊 Trading Dashboard")
+st.title("📊 Nifty 50 Swing Trading Scanner")
 
-conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+engine = PaperEngine()
 
-# ---------------------------
-# RUN SCANNER
-# ---------------------------
-if st.button("🚀 Run Scanner Now"):
-    with st.spinner("Running scanner..."):
-        engine = PaperEngine()
-        signals, trades = engine.run_once()
+# Run button
+if st.button("Run Scanner"):
 
-    st.success(f"Done | Signals: {signals} | Trades: {trades}")
+    with st.spinner("Scanning market..."):
 
-# ---------------------------
-# LOAD DATA
-# ---------------------------
-df = pd.read_sql("SELECT * FROM trades ORDER BY created_at DESC", conn)
+        trades = engine.run()
 
-# ---------------------------
-# TABS
-# ---------------------------
-tab1, tab2, tab3 = st.tabs(["Open Trades", "Closed Trades", "Analytics"])
-
-# ---------------------------
-# OPEN TRADES
-# ---------------------------
-with tab1:
-    st.subheader("Open Trades")
-    st.dataframe(df[df["status"] == "OPEN"])
-
-# ---------------------------
-# CLOSED TRADES
-# ---------------------------
-with tab2:
-    st.subheader("Closed Trades")
-    st.dataframe(df[df["status"] == "CLOSED"])
-
-# ---------------------------
-# ANALYTICS
-# ---------------------------
-with tab3:
-    st.subheader("Performance")
-
-    if len(df) == 0:
-        st.info("No trades yet")
+    # No trades case
+    if not trades:
+        st.warning("❌ No trades found (Market weak or no setups)")
     else:
-        df["cum_pnl"] = df["pnl"].fillna(0).cumsum()
-        st.line_chart(df["cum_pnl"])
-        st.write("Total PnL:", df["pnl"].sum())
+        df = pd.DataFrame(trades)
+
+        st.success(f"✅ {len(df)} trades found")
+
+        # Show top trades
+        st.dataframe(df, use_container_width=True)
+
+        # Download CSV
+        csv = df.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="Download Trades CSV",
+            data=csv,
+            file_name="swing_trades.csv",
+            mime="text/csv"
+        )
