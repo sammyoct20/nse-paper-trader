@@ -27,6 +27,7 @@ class PaperEngine:
             qty INT,
             status TEXT,
             pnl FLOAT DEFAULT 0,
+            exit_reason TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             exit_time TIMESTAMP
         );
@@ -101,7 +102,6 @@ class PaperEngine:
                     continue
 
                 df = self.add_indicators(df)
-
                 score = self.score_stock(df)
 
                 if score >= 6:
@@ -112,7 +112,6 @@ class PaperEngine:
                 continue
 
         scored.sort(key=lambda x: x[2], reverse=True)
-
         return scored
 
     # ---------------- GENERATE TRADES ---------------- #
@@ -176,7 +175,7 @@ class PaperEngine:
         self.conn.commit()
         cur.close()
 
-    # ---------------- UPDATE (FIXED SL LOGIC) ---------------- #
+    # ---------------- UPDATE TRADES (FIXED) ---------------- #
     def update_trades(self):
         cur = self.conn.cursor()
 
@@ -206,23 +205,29 @@ class PaperEngine:
                 high = float(df["High"].iloc[-1])
 
                 exit_price = None
+                exit_reason = None
 
-                # SL HIT (intra candle)
+                # SL HIT
                 if low <= sl:
                     exit_price = sl
+                    exit_reason = "STOP LOSS HIT"
 
                 # TARGET HIT
                 elif high >= target:
                     exit_price = target
+                    exit_reason = "TARGET HIT"
 
                 if exit_price:
                     pnl = (exit_price - entry) * qty
 
                     cur.execute("""
                     UPDATE trades
-                    SET status='CLOSED', pnl=%s, exit_time=%s
+                    SET status='CLOSED',
+                        pnl=%s,
+                        exit_time=%s,
+                        exit_reason=%s
                     WHERE id=%s
-                    """, (pnl, datetime.now(), trade_id))
+                    """, (pnl, datetime.now(), exit_reason, trade_id))
 
             except:
                 continue
