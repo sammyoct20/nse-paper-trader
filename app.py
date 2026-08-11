@@ -1,37 +1,43 @@
 import streamlit as st
 import pandas as pd
 from engine import PaperEngine
+from db import get_conn
 
-st.set_page_config(page_title="Swing Scanner", layout="wide")
-
-st.title("📊 Nifty 50 Swing Trading Scanner")
+st.title("📊 Trading Dashboard")
 
 engine = PaperEngine()
 
-# Run button
 if st.button("Run Scanner"):
+    trades = engine.run()
 
-    with st.spinner("Scanning market..."):
-
-        trades = engine.run()
-
-    # No trades case
-    if not trades:
-        st.warning("❌ No trades found (Market weak or no setups)")
+    if trades:
+        st.success(f"{len(trades)} new trades added")
     else:
-        df = pd.DataFrame(trades)
+        st.warning("No new trades")
 
-        st.success(f"✅ {len(df)} trades found")
+# -------- OPEN TRADES --------
+st.subheader("Open Trades")
 
-        # Show top trades
-        st.dataframe(df, use_container_width=True)
+conn = get_conn()
+open_df = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
 
-        # Download CSV
-        csv = df.to_csv(index=False).encode("utf-8")
+st.dataframe(open_df)
 
-        st.download_button(
-            label="Download Trades CSV",
-            data=csv,
-            file_name="swing_trades.csv",
-            mime="text/csv"
-        )
+# -------- CLOSED TRADES --------
+st.subheader("Closed Trades")
+
+closed_df = pd.read_sql("SELECT * FROM trades WHERE status='CLOSED'", conn)
+
+st.dataframe(closed_df)
+
+# -------- PNL --------
+st.subheader("Performance")
+
+if not closed_df.empty:
+    total_pnl = closed_df["pnl"].sum()
+    win_rate = (closed_df["pnl"] > 0).mean() * 100
+
+    st.metric("Total PnL", round(total_pnl, 2))
+    st.metric("Win Rate", f"{round(win_rate,2)}%")
+
+conn.close()
