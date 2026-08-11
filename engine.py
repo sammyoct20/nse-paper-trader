@@ -4,31 +4,15 @@ import psycopg2
 import os
 from datetime import datetime
 
-
 class PaperEngine:
 
     def __init__(self):
-        db_url = os.getenv("DATABASE_URL")
-        self.conn = psycopg2.connect(db_url)
+        self.conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         self.create_tables()
 
-        self.capital = 100000
+        self.total_capital = 100000
+        self.max_trades = 3
         self.risk_per_trade = 0.01
-
-    # ---------------- NIFTY 50 ---------------- #
-    def get_nifty50(self):
-        return [
-            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
-            "SBIN.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LT.NS",
-            "HCLTECH.NS","AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS","SUNPHARMA.NS",
-            "ULTRACEMCO.NS","TITAN.NS","BAJFINANCE.NS","BAJAJFINSV.NS","WIPRO.NS",
-            "NESTLEIND.NS","HINDUNILVR.NS","POWERGRID.NS","NTPC.NS","ONGC.NS",
-            "COALINDIA.NS","TATASTEEL.NS","JSWSTEEL.NS","GRASIM.NS","ADANIENT.NS",
-            "ADANIPORTS.NS","APOLLOHOSP.NS","BRITANNIA.NS","CIPLA.NS","DIVISLAB.NS",
-            "DRREDDY.NS","EICHERMOT.NS","HEROMOTOCO.NS","INDUSINDBK.NS","BAJAJ-AUTO.NS",
-            "M&M.NS","SHRIRAMFIN.NS","TATACONSUM.NS","TECHM.NS","UPL.NS",
-            "HDFCLIFE.NS","SBILIFE.NS","ICICIPRULI.NS","HAVELLS.NS","PIDILITIND.NS"
-        ]
 
     # ---------------- DB ---------------- #
     def create_tables(self):
@@ -52,9 +36,16 @@ class PaperEngine:
         self.conn.commit()
         cur.close()
 
+    # ---------------- STOCK LIST ---------------- #
+    def get_nifty50(self):
+        return [
+            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
+            "SBIN.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LT.NS",
+            "HCLTECH.NS","AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS","SUNPHARMA.NS"
+        ]
+
     # ---------------- INDICATORS ---------------- #
     def add_indicators(self, df):
-
         df["EMA20"] = df["Close"].ewm(span=20).mean()
         df["EMA50"] = df["Close"].ewm(span=50).mean()
         df["EMA200"] = df["Close"].ewm(span=200).mean()
@@ -68,36 +59,29 @@ class PaperEngine:
         df["VOL_AVG"] = df["Volume"].rolling(20).mean()
         df["HH"] = df["High"].rolling(20).max()
 
-        df["TR"] = df[["High","Low","Close"]].apply(
-            lambda x: max(x["High"]-x["Low"],
-                          abs(x["High"]-x["Close"]),
-                          abs(x["Low"]-x["Close"])),
-            axis=1
-        )
-        df["ATR"] = df["TR"].rolling(14).mean()
-
         return df
 
-    # ---------------- MARKET FILTER ---------------- #
-    def is_market_bullish(self):
-        df = yf.download("^NSEI", period="5d", interval="15m",
-                         auto_adjust=False, progress=False)
+    # ---------------- SCORING ---------------- #
+    def score_stock(self, df):
+        last = df.iloc[-1]
+        score = 0
 
-        if df.empty:
-            return False
+        if last["Close"] > last["EMA50"]:
+            score += 2
+        if last["EMA50"] > last["EMA200"]:
+            score += 2
+        if 55 < last["RSI"] < 70:
+            score += 1
+        if last["Volume"] > 1.2 * last["VOL_AVG"]:
+            score += 2
+        if last["Close"] > df["HH"].iloc[-2]:
+            score += 3
 
-        df["EMA50"] = df["Close"].ewm(span=50).mean()
-
-        return float(df["Close"].iloc[-1].item()) > float(df["EMA50"].iloc[-1].item())
+        return score
 
     # ---------------- SCAN ---------------- #
     def scan_market(self):
-
         symbols = self.get_nifty50()
-
-        if not self.is_market_bullish():
-            print("Market not bullish")
-            return []
 
         df_all = yf.download(
             tickers=" ".join(symbols),
@@ -108,7 +92,7 @@ class PaperEngine:
             threads=True
         )
 
-        signals = []
+        scored = []
 
         for sym in symbols:
             try:
@@ -118,47 +102,57 @@ class PaperEngine:
                     continue
 
                 df = self.add_indicators(df)
-                last = df.iloc[-1]
 
-                trend = last["Close"] > last["EMA50"] > last["EMA200"]
-                momentum = 55 < last["RSI"] < 70
-                breakout = last["Close"] > df["HH"].iloc[-2] * 0.995
-                volume = last["Volume"] > 1.2 * last["VOL_AVG"]
+                score = self.score_stock(df)
 
-                if trend and momentum and breakout and volume:
-                    signals.append({
-                        "symbol": sym,
-                        "price": float(last["Close"].item()),
-                        "atr": float(last["ATR"].item())
-                    })
+                if score >= 6:   # threshold filter
+                    price = float(df["Close"].iloc[-1])
+                    scored.append((sym, price, score))
 
-            except Exception as e:
-                print(sym, e)
+            except:
+                continue
 
-        return signals
+        # Sort by strongest setups
+        scored.sort(key=lambda x: x[2], reverse=True)
 
-    # ---------------- TRADE ---------------- #
+        return scored
+
+    # ---------------- POSITION SIZING ---------------- #
     def generate_trades(self, signals):
+
+        # Check open trades
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'")
+        open_count = cur.fetchone()[0]
+        cur.close()
+
+        slots_available = self.max_trades - open_count
+
+        if slots_available <= 0:
+            return []
+
+        signals = signals[:slots_available]
+
+        capital_per_trade = self.total_capital / self.max_trades
 
         trades = []
 
-        for s in signals:
-            entry = s["price"]
-            atr = s["atr"]
+        for sym, price, score in signals:
 
-            sl = entry - (1.5 * atr)
-            target = entry + (2 * atr)
+            stop_loss = price * 0.98   # 2% SL
+            target = price * 1.03      # 3% target
 
-            risk = entry - sl
-            if risk <= 0:
+            risk = price - stop_loss
+            qty = int(capital_per_trade / price)
+
+            # Smart entry: avoid weak candles
+            if price < price * 0.995:
                 continue
 
-            qty = int((self.capital * self.risk_per_trade) / risk)
-
             trades.append({
-                "symbol": s["symbol"],
-                "entry": round(entry, 2),
-                "stop_loss": round(sl, 2),
+                "symbol": sym,
+                "entry": round(price, 2),
+                "stop_loss": round(stop_loss, 2),
                 "target": round(target, 2),
                 "qty": qty,
                 "status": "OPEN"
@@ -171,6 +165,7 @@ class PaperEngine:
         cur = self.conn.cursor()
 
         for t in trades:
+
             cur.execute("""
             SELECT COUNT(*) FROM trades
             WHERE symbol=%s AND status='OPEN'
@@ -211,7 +206,7 @@ class PaperEngine:
                 if df.empty:
                     continue
 
-                price = float(df["Close"].iloc[-1].item())
+                price = float(df["Close"].iloc[-1])
 
                 if price <= sl or price >= target:
                     pnl = (price - entry) * qty
@@ -222,20 +217,16 @@ class PaperEngine:
                     WHERE id=%s
                     """, (pnl, datetime.now(), trade_id))
 
-            except Exception as e:
-                print("Update error:", e)
+            except:
+                continue
 
         self.conn.commit()
         cur.close()
 
-    # ---------------- WORKER SUPPORT ---------------- #
+    # ---------------- MAIN ---------------- #
     def run_once(self):
-        print("=== ENGINE START ===")
-
         signals = self.scan_market()
         trades = self.generate_trades(signals)
 
         self.save_trades(trades)
         self.update_trades()
-
-        print("=== ENGINE END ===")
