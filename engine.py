@@ -7,7 +7,7 @@ class PaperEngine:
 
     def __init__(self):
 
-        # FULL NIFTY 50
+        # NIFTY 50 STOCKS
         self.symbols = [
             "ADANIENT.NS","ADANIPORTS.NS","APOLLOHOSP.NS","ASIANPAINT.NS","AXISBANK.NS",
             "BAJAJ-AUTO.NS","BAJFINANCE.NS","BAJAJFINSV.NS","BPCL.NS","BHARTIARTL.NS",
@@ -26,10 +26,18 @@ class PaperEngine:
         try:
             df = yf.download(symbol, period="6mo", interval="1d", progress=False)
 
-            if df is None or df.empty or len(df) < 60:
+            if df is None or df.empty:
+                return None
+
+            # FIX: MultiIndex columns issue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            if len(df) < 60:
                 return None
 
             return df
+
         except:
             return None
 
@@ -59,23 +67,35 @@ class PaperEngine:
             return False
 
         df = self.apply_indicators(df)
+
         last = df.iloc[-1]
 
-        return last["Close"] > last["EMA20"] > last["EMA50"]
+        try:
+            price = float(last["Close"])
+            ema20 = float(last["EMA20"])
+            ema50 = float(last["EMA50"])
+        except:
+            return False
+
+        return price > ema20 > ema50
 
     # ---------------- SCORING ----------------
-    def score(self, price, ema20, ema50, rsi, volume, avg_volume):
+    def calculate_score(self, price, ema20, ema50, rsi, volume, avg_volume):
 
         score = 0
 
+        # Trend strength
         trend = (ema20 - ema50) / ema50
         score += trend * 100
 
+        # RSI sweet zone
         score += max(0, 15 - abs(rsi - 55))
 
+        # Volume boost
         if volume > avg_volume:
             score += 10
 
+        # Pullback quality
         distance = abs(price - ema20) / ema20
         score += max(0, 10 - (distance * 100))
 
@@ -89,44 +109,61 @@ class PaperEngine:
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        price = float(last["Close"])
-        ema20 = float(last["EMA20"])
-        ema50 = float(last["EMA50"])
-        rsi = float(last["RSI"])
-        atr = float(last["ATR"])
-        volume = float(last["Volume"])
-        avg_volume = float(df["Volume"].tail(20).mean())
+        try:
+            price = float(last["Close"])
+            ema20 = float(last["EMA20"])
+            ema50 = float(last["EMA50"])
+            rsi = float(last["RSI"])
+            atr = float(last["ATR"])
+            volume = float(last["Volume"])
+            avg_volume = float(df["Volume"].tail(20).mean())
+        except:
+            return None
 
+        # Trend
         if not (price > ema20 > ema50):
             return None
 
+        # Pullback
         if (price - ema20) / ema20 > 0.03:
             return None
 
+        # RSI
         if not (50 < rsi < 65):
             return None
 
+        # Volume
         if volume < avg_volume:
             return None
 
+        # Confirmation
         if price <= float(prev["Close"]):
             return None
 
+        # SL (ATR based)
         sl = price - (1.5 * atr)
         risk = price - sl
 
-        if risk <= 0 or (risk / price) > 0.03:
+        if risk <= 0:
             return None
 
+        # Max SL filter
+        if (risk / price) > 0.03:
+            return None
+
+        # Target
         target = price + (2 * risk)
 
+        # RR validation
         rr = (target - price) / risk
         if rr < 2:
             return None
 
-        score = self.score(price, ema20, ema50, rsi, volume, avg_volume)
+        # Score
+        score = self.calculate_score(price, ema20, ema50, rsi, volume, avg_volume)
 
         return {
+            "symbol": "",
             "entry": round(price, 2),
             "sl": round(sl, 2),
             "target": round(target, 2),
@@ -138,6 +175,7 @@ class PaperEngine:
     def run(self):
 
         if not self.market_ok():
+            print("❌ Market not favorable")
             return []
 
         results = []
@@ -152,16 +190,16 @@ class PaperEngine:
             signal = self.generate_signal(df)
 
             if signal:
-                results.append({
-                    "symbol": sym,
-                    **signal
-                })
+                signal["symbol"] = sym
+                results.append(signal)
 
-            time.sleep(0.3)  # avoid rate limit
+            time.sleep(0.3)  # prevent rate limit
 
+        # Sort by score
         results = sorted(results, key=lambda x: x["score"], reverse=True)
 
         return results
 
+    # Required for worker
     def run_once(self):
         return self.run()
