@@ -4,10 +4,10 @@ from engine import PaperEngine
 from db import get_conn, create_tables
 
 # ---------------- INIT ----------------
+st.set_page_config(layout="wide")
 create_tables()
 engine = PaperEngine()
 
-st.set_page_config(layout="wide")
 st.title("📊 Trading Dashboard")
 
 # ---------------- RUN SCANNER ----------------
@@ -27,23 +27,22 @@ closed_df = pd.read_sql("SELECT * FROM trades WHERE status='CLOSED'", conn)
 
 conn.close()
 
-# ---------------- CLEAN DATA (FIXED) ----------------
+# ---------------- CLEAN DATA ----------------
 def clean_df(df):
 
     if df.empty:
         return df
 
-    # Remove .NS for better display
+    # Remove .NS (shorter names)
     if "symbol" in df.columns:
         df["symbol"] = df["symbol"].astype(str).str.replace(".NS", "", regex=False)
 
-    # Ensure numeric columns are actually numeric
+    # Convert numeric safely
     cols = ["entry", "sl", "target", "entry_price", "exit_price", "pnl"]
 
     for col in cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            df[col] = df[col].round(2)
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
 
     return df
 
@@ -51,33 +50,8 @@ def clean_df(df):
 open_df = clean_df(open_df)
 closed_df = clean_df(closed_df)
 
-# ---------------- CARD UI ----------------
-def trade_card(trade, is_closed=False):
-
-    # Color logic
-    if is_closed:
-        color = "green" if trade.get("pnl", 0) > 0 else "red"
-    else:
-        color = "blue"
-
-    st.markdown(f"""
-    <div style="
-        padding:15px;
-        border-radius:12px;
-        background-color:#1e1e1e;
-        margin-bottom:12px;
-        border-left:6px solid {color};
-    ">
-        <h4>{trade.get('symbol','')}</h4>
-        <p>Entry: {trade.get('entry_price','')}</p>
-        <p>SL: {trade.get('sl','')}</p>
-        <p>Target: {trade.get('target','')}</p>
-        {"<p>Exit: " + str(trade.get('exit_price','')) + "</p>" if is_closed else ""}
-        {"<p style='color:" + color + "'>PnL: " + str(trade.get('pnl','')) + "</p>" if is_closed else ""}
-        {"<p>Reason: " + str(trade.get('exit_reason','')) + "</p>" if is_closed else ""}
-    </div>
-    """, unsafe_allow_html=True)
-
+# 🔥 THIS FIXES COLUMN TRUNCATION
+pd.set_option("display.max_colwidth", None)
 
 # ---------------- TABS ----------------
 tab1, tab2, tab3 = st.tabs(["📂 Open Trades", "📁 Closed Trades", "📈 Performance"])
@@ -87,16 +61,22 @@ with tab1:
     if open_df.empty:
         st.info("No open trades")
     else:
-        for _, row in open_df.iterrows():
-            trade_card(row)
+        st.dataframe(
+            open_df,
+            use_container_width=True,
+            height=500
+        )
 
 # ---------------- CLOSED TRADES ----------------
 with tab2:
     if closed_df.empty:
         st.info("No closed trades")
     else:
-        for _, row in closed_df.iterrows():
-            trade_card(row, is_closed=True)
+        st.dataframe(
+            closed_df,
+            use_container_width=True,
+            height=500
+        )
 
 # ---------------- PERFORMANCE ----------------
 with tab3:
