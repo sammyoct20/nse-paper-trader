@@ -10,8 +10,16 @@ class PaperEngine:
         create_tables()
 
         self.symbols = [
-            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
-            "ITC.NS","SBIN.NS","LT.NS","BHARTIARTL.NS","ASIANPAINT.NS"
+            "ADANIENT.NS","ADANIPORTS.NS","APOLLOHOSP.NS","ASIANPAINT.NS","AXISBANK.NS",
+            "BAJAJ-AUTO.NS","BAJFINANCE.NS","BAJAJFINSV.NS","BPCL.NS","BHARTIARTL.NS",
+            "BRITANNIA.NS","CIPLA.NS","COALINDIA.NS","DIVISLAB.NS","DRREDDY.NS",
+            "EICHERMOT.NS","GRASIM.NS","HCLTECH.NS","HDFCBANK.NS","HDFCLIFE.NS",
+            "HEROMOTOCO.NS","HINDALCO.NS","HINDUNILVR.NS","ICICIBANK.NS","ITC.NS",
+            "INDUSINDBK.NS","INFY.NS","JSWSTEEL.NS","KOTAKBANK.NS","LT.NS",
+            "M&M.NS","MARUTI.NS","NTPC.NS","NESTLEIND.NS","ONGC.NS",
+            "POWERGRID.NS","RELIANCE.NS","SBILIFE.NS","SBIN.NS","SUNPHARMA.NS",
+            "TCS.NS","TATACONSUM.NS","TATAMOTORS.NS","TATASTEEL.NS","TECHM.NS",
+            "TITAN.NS","ULTRACEMCO.NS","UPL.NS","WIPRO.NS"
         ]
 
     # ---------------- DATA ----------------
@@ -53,27 +61,34 @@ class PaperEngine:
         df = self.apply_indicators(df)
         last = df.iloc[-1]
 
-        return float(last["Close"]) > float(last["EMA20"]) > float(last["EMA50"])
-
-    # ---------------- RELATIVE STRENGTH ----------------
-    def relative_strength(self, df_stock, df_nifty):
         try:
-            stock_ret = (df_stock["Close"].iloc[-1] / df_stock["Close"].iloc[-20]) - 1
-            nifty_ret = (df_nifty["Close"].iloc[-1] / df_nifty["Close"].iloc[-20]) - 1
-            return stock_ret > nifty_ret
+            return float(last["Close"]) > float(last["EMA20"])
         except:
             return False
 
-    # ---------------- WEEKLY TREND ----------------
+    # ---------------- RELATIVE STRENGTH (RELAXED) ----------------
+    def relative_strength(self, df_stock, df_nifty):
+        try:
+            stock_ret = (df_stock["Close"].iloc[-20] - df_stock["Close"].iloc[-1]) * -1
+            nifty_ret = (df_nifty["Close"].iloc[-20] - df_nifty["Close"].iloc[-1]) * -1
+
+            return stock_ret > (nifty_ret - 0.02)
+        except:
+            return False
+
+    # ---------------- WEEKLY TREND (SOFT FILTER) ----------------
     def weekly_trend_ok(self, symbol):
         df = self.get_data(symbol, interval="1wk")
         if df is None:
-            return False
+            return True   # allow if data missing
 
         df["EMA20"] = df["Close"].ewm(span=20).mean()
         last = df.iloc[-1]
 
-        return float(last["Close"]) > float(last["EMA20"])
+        try:
+            return float(last["Close"]) > float(last["EMA20"])
+        except:
+            return True
 
     # ---------------- SIGNAL ----------------
     def generate_signal(self, df):
@@ -81,7 +96,6 @@ class PaperEngine:
         df = self.apply_indicators(df)
 
         last = df.iloc[-1]
-        prev = df.iloc[-2]
 
         price = float(last["Close"])
         ema20 = float(last["EMA20"])
@@ -89,21 +103,30 @@ class PaperEngine:
         rsi = float(last["RSI"])
         atr = float(last["ATR"])
 
+        # TREND
         if not (price > ema20 > ema50):
             return None
 
-        if not (50 < rsi < 65):
+        # RELAXED RSI
+        if not (45 < rsi < 70):
             return None
 
-        if price <= float(prev["Close"]):
+        # REMOVE STRICT MOMENTUM BLOCK
+        if price < ema20:
             return None
 
+        # SL + RR
         sl = price - (1.5 * atr)
-        target = price + (2 * (price - sl))
+        risk = price - sl
+
+        if risk <= 0:
+            return None
+
+        target = price + (2 * risk)
 
         return price, sl, target
 
-    # ---------------- INSERT ----------------
+    # ---------------- INSERT TRADE ----------------
     def insert_trade(self, symbol, entry, sl, target):
 
         conn = get_conn()
@@ -175,6 +198,7 @@ class PaperEngine:
         self.update_trades()
 
         if not self.market_ok():
+            print("Market weak")
             return []
 
         df_nifty = self.get_data("^NSEI")
@@ -189,8 +213,9 @@ class PaperEngine:
             if not self.relative_strength(df, df_nifty):
                 continue
 
+            # SOFT weekly filter (not blocking)
             if not self.weekly_trend_ok(sym):
-                continue
+                pass
 
             signal = self.generate_signal(df)
 
@@ -200,12 +225,12 @@ class PaperEngine:
 
                 results.append({
                     "symbol": sym,
-                    "entry": entry,
-                    "sl": sl,
-                    "target": target
+                    "entry": round(entry, 2),
+                    "sl": round(sl, 2),
+                    "target": round(target, 2)
                 })
 
-            time.sleep(0.3)
+            time.sleep(0.2)
 
         return results
 
