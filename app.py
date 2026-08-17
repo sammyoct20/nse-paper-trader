@@ -8,7 +8,6 @@ create_tables()
 engine = PaperEngine()
 
 st.set_page_config(layout="wide")
-
 st.title("📊 Trading Dashboard")
 
 # ---------------- RUN SCANNER ----------------
@@ -28,19 +27,22 @@ closed_df = pd.read_sql("SELECT * FROM trades WHERE status='CLOSED'", conn)
 
 conn.close()
 
-# ---------------- CLEAN DATA ----------------
+# ---------------- CLEAN DATA (FIXED) ----------------
 def clean_df(df):
+
     if df.empty:
         return df
 
-    # Remove .NS for mobile readability
+    # Remove .NS for better display
     if "symbol" in df.columns:
-        df["symbol"] = df["symbol"].str.replace(".NS", "")
+        df["symbol"] = df["symbol"].astype(str).str.replace(".NS", "", regex=False)
 
-    # Round numeric values
+    # Ensure numeric columns are actually numeric
     cols = ["entry", "sl", "target", "entry_price", "exit_price", "pnl"]
+
     for col in cols:
         if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
             df[col] = df[col].round(2)
 
     return df
@@ -52,8 +54,9 @@ closed_df = clean_df(closed_df)
 # ---------------- CARD UI ----------------
 def trade_card(trade, is_closed=False):
 
+    # Color logic
     if is_closed:
-        color = "green" if trade["pnl"] > 0 else "red"
+        color = "green" if trade.get("pnl", 0) > 0 else "red"
     else:
         color = "blue"
 
@@ -62,16 +65,16 @@ def trade_card(trade, is_closed=False):
         padding:15px;
         border-radius:12px;
         background-color:#1e1e1e;
-        margin-bottom:10px;
+        margin-bottom:12px;
         border-left:6px solid {color};
     ">
-        <h4>{trade['symbol']}</h4>
-        <p>Entry: {trade['entry_price']}</p>
-        <p>SL: {trade['sl']}</p>
-        <p>Target: {trade['target']}</p>
-        {"<p>Exit: " + str(trade['exit_price']) + "</p>" if is_closed else ""}
-        {"<p style='color:" + color + "'>PnL: " + str(trade['pnl']) + "</p>" if is_closed else ""}
-        {"<p>Reason: " + str(trade['exit_reason']) + "</p>" if is_closed else ""}
+        <h4>{trade.get('symbol','')}</h4>
+        <p>Entry: {trade.get('entry_price','')}</p>
+        <p>SL: {trade.get('sl','')}</p>
+        <p>Target: {trade.get('target','')}</p>
+        {"<p>Exit: " + str(trade.get('exit_price','')) + "</p>" if is_closed else ""}
+        {"<p style='color:" + color + "'>PnL: " + str(trade.get('pnl','')) + "</p>" if is_closed else ""}
+        {"<p>Reason: " + str(trade.get('exit_reason','')) + "</p>" if is_closed else ""}
     </div>
     """, unsafe_allow_html=True)
 
