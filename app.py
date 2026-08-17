@@ -12,19 +12,13 @@ st.title("📊 Trading Dashboard")
 
 # ---------------- RUN SCANNER ----------------
 if st.button("🚀 Run Scanner"):
-    trades = engine.run()
-
-    if trades:
-        st.success(f"{len(trades)} new trades added")
-    else:
-        st.warning("No new trades")
+    engine.run()
+    st.success("Scanner executed")
 
 # ---------------- LOAD DATA ----------------
 conn = get_conn()
 
-open_df = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
-closed_df = pd.read_sql("SELECT * FROM trades WHERE status='CLOSED'", conn)
-
+df = pd.read_sql("SELECT * FROM trades", conn)
 conn.close()
 
 # ---------------- CLEAN DATA ----------------
@@ -33,11 +27,9 @@ def clean_df(df):
     if df.empty:
         return df
 
-    # Remove .NS (shorter names)
     if "symbol" in df.columns:
         df["symbol"] = df["symbol"].astype(str).str.replace(".NS", "", regex=False)
 
-    # Convert numeric safely
     cols = ["entry", "sl", "target", "entry_price", "exit_price", "pnl"]
 
     for col in cols:
@@ -47,39 +39,46 @@ def clean_df(df):
     return df
 
 
-open_df = clean_df(open_df)
-closed_df = clean_df(closed_df)
+df = clean_df(df)
 
-# 🔥 THIS FIXES COLUMN TRUNCATION
-pd.set_option("display.max_colwidth", None)
+# ---------------- FILTER DATA ----------------
+open_df = df[df["status"] == "OPEN"]
+closed_df = df[df["status"] == "CLOSED"]
 
-# ---------------- TABS ----------------
-tab1, tab2, tab3 = st.tabs(["📂 Open Trades", "📁 Closed Trades", "📈 Performance"])
+intraday_df = open_df[open_df["type"] == "INTRADAY"]
+swing_df = open_df[open_df["type"] == "SWING"]
 
-# ---------------- OPEN TRADES ----------------
+# ---------------- UI TABS ----------------
+tab1, tab2, tab3, tab4 = st.tabs([
+    "⚡ Intraday",
+    "📈 Swing",
+    "📁 Closed Trades",
+    "📊 Performance"
+])
+
+# ---------------- INTRADAY TAB ----------------
 with tab1:
-    if open_df.empty:
-        st.info("No open trades")
+    if intraday_df.empty:
+        st.warning("No intraday trades")
     else:
-        st.dataframe(
-            open_df,
-            use_container_width=True,
-            height=500
-        )
+        st.dataframe(intraday_df, use_container_width=True)
+
+# ---------------- SWING TAB ----------------
+with tab2:
+    if swing_df.empty:
+        st.warning("No swing trades")
+    else:
+        st.dataframe(swing_df, use_container_width=True)
 
 # ---------------- CLOSED TRADES ----------------
-with tab2:
+with tab3:
     if closed_df.empty:
-        st.info("No closed trades")
+        st.warning("No closed trades")
     else:
-        st.dataframe(
-            closed_df,
-            use_container_width=True,
-            height=500
-        )
+        st.dataframe(closed_df, use_container_width=True)
 
 # ---------------- PERFORMANCE ----------------
-with tab3:
+with tab4:
     if closed_df.empty:
         st.info("No data yet")
     else:
@@ -88,7 +87,7 @@ with tab3:
 
         col1, col2 = st.columns(2)
         col1.metric("Total PnL", round(total_pnl, 2))
-        col2.metric("Win Rate", f"{round(win_rate,2)}%")
+        col2.metric("Win Rate", f"{round(win_rate, 2)}%")
 
         closed_df["cum_pnl"] = closed_df["pnl"].cumsum()
         st.line_chart(closed_df["cum_pnl"])
