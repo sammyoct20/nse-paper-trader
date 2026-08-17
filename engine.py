@@ -1,7 +1,6 @@
 import yfinance as yf
 import pandas as pd
 from db import get_conn, create_tables
-from datetime import datetime
 
 
 class PaperEngine:
@@ -16,7 +15,13 @@ class PaperEngine:
     # ---------------- DATA ----------------
     def get_data(self, symbol, interval="1d", period="6mo"):
         try:
-            df = yf.download(symbol, period=period, interval=interval, progress=False)
+            df = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                progress=False,
+                auto_adjust=True
+            )
 
             if df is None or df.empty:
                 return None
@@ -43,9 +48,8 @@ class PaperEngine:
 
         return df
 
-    # ---------------- SWING SIGNAL ----------------
+    # ---------------- SWING ----------------
     def swing_signal(self, df):
-
         df = self.apply_indicators(df)
         last = df.iloc[-1]
 
@@ -66,9 +70,8 @@ class PaperEngine:
 
         return price, sl, target
 
-    # ---------------- INTRADAY ORB ----------------
+    # ---------------- INTRADAY ----------------
     def intraday_signal(self):
-
         df = self.get_data("^NSEI", interval="5m", period="5d")
         if df is None or len(df) < 20:
             return None
@@ -84,22 +87,15 @@ class PaperEngine:
         price = float(latest["Close"])
 
         if price > orb_high:
-            direction = "CALL"
-            sl = orb_low
-            target = price + (price - sl) * 2
+            return "NIFTY", "CALL", price, orb_low, price + (price - orb_low) * 2
 
         elif price < orb_low:
-            direction = "PUT"
-            sl = orb_high
-            target = price - (sl - price) * 2
+            return "NIFTY", "PUT", price, orb_high, price - (orb_high - price) * 2
 
-        else:
-            return None
+        return None
 
-        return "NIFTY", direction, price, sl, target
-
-    # ---------------- INSERT TRADE ----------------
-    def insert_trade(self, symbol, entry, sl, target, trade_type, direction="BUY"):
+    # ---------------- INSERT ----------------
+    def insert_trade(self, symbol, entry, sl, target, ttype, direction):
 
         conn = get_conn()
         cur = conn.cursor()
@@ -107,7 +103,7 @@ class PaperEngine:
         cur.execute("""
         SELECT * FROM trades 
         WHERE symbol=? AND status='OPEN' AND type=?
-        """, (symbol, trade_type))
+        """, (symbol, ttype))
 
         if cur.fetchone():
             conn.close()
@@ -117,12 +113,12 @@ class PaperEngine:
         INSERT INTO trades 
         (symbol, entry, sl, target, status, entry_price, type, direction)
         VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?)
-        """, (symbol, entry, sl, target, entry, trade_type, direction))
+        """, (symbol, entry, sl, target, entry, ttype, direction))
 
         conn.commit()
         conn.close()
 
-    # ---------------- UPDATE TRADES ----------------
+    # ---------------- UPDATE ----------------
     def update_trades(self):
 
         conn = get_conn()
@@ -133,10 +129,8 @@ class PaperEngine:
         FROM trades WHERE status='OPEN'
         """)
 
-        trades = cur.fetchall()
-
-        for t in trades:
-            trade_id, symbol, entry_price, sl, target = t
+        for trade in cur.fetchall():
+            trade_id, symbol, entry, sl, target = trade
 
             if symbol == "NIFTY":
                 df = self.get_data("^NSEI", interval="5m", period="1d")
@@ -156,17 +150,16 @@ class PaperEngine:
             if low <= sl:
                 exit_price = sl
                 reason = "SL HIT"
-
             elif high >= target:
                 exit_price = target
                 reason = "TARGET HIT"
 
             if exit_price:
-                pnl = exit_price - entry_price
+                pnl = exit_price - entry
 
                 cur.execute("""
-                UPDATE trades
-                SET status='CLOSED',
+                UPDATE trades SET
+                    status='CLOSED',
                     exit_price=?,
                     pnl=?,
                     exit_reason=?,
@@ -177,27 +170,24 @@ class PaperEngine:
         conn.commit()
         conn.close()
 
-    # ---------------- RUN ENGINE ----------------
+    # ---------------- RUN ----------------
     def run(self):
 
         self.update_trades()
 
-        # -------- SWING --------
+        # Swing
         for sym in self.swing_symbols:
-
             df = self.get_data(sym)
             if df is None:
                 continue
 
-            signal = self.swing_signal(df)
-
-            if signal:
-                entry, sl, target = signal
+            sig = self.swing_signal(df)
+            if sig:
+                entry, sl, target = sig
                 self.insert_trade(sym, entry, sl, target, "SWING", "BUY")
 
-        # -------- INTRADAY --------
+        # Intraday
         intraday = self.intraday_signal()
-
         if intraday:
             symbol, direction, entry, sl, target = intraday
             self.insert_trade(symbol, entry, sl, target, "INTRADAY", direction)
