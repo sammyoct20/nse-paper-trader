@@ -10,16 +10,8 @@ class PaperEngine:
         create_tables()
 
         self.symbols = [
-            "ADANIENT.NS","ADANIPORTS.NS","APOLLOHOSP.NS","ASIANPAINT.NS","AXISBANK.NS",
-            "BAJAJ-AUTO.NS","BAJFINANCE.NS","BAJAJFINSV.NS","BPCL.NS","BHARTIARTL.NS",
-            "BRITANNIA.NS","CIPLA.NS","COALINDIA.NS","DIVISLAB.NS","DRREDDY.NS",
-            "EICHERMOT.NS","GRASIM.NS","HCLTECH.NS","HDFCBANK.NS","HDFCLIFE.NS",
-            "HEROMOTOCO.NS","HINDALCO.NS","HINDUNILVR.NS","ICICIBANK.NS","ITC.NS",
-            "INDUSINDBK.NS","INFY.NS","JSWSTEEL.NS","KOTAKBANK.NS","LT.NS",
-            "M&M.NS","MARUTI.NS","NTPC.NS","NESTLEIND.NS","ONGC.NS",
-            "POWERGRID.NS","RELIANCE.NS","SBILIFE.NS","SBIN.NS","SUNPHARMA.NS",
-            "TCS.NS","TATACONSUM.NS","TATAMOTORS.NS","TATASTEEL.NS","TECHM.NS",
-            "TITAN.NS","ULTRACEMCO.NS","UPL.NS","WIPRO.NS"
+            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
+            "ITC.NS","SBIN.NS","LT.NS","BHARTIARTL.NS","ASIANPAINT.NS"
         ]
 
     # ---------------- DATA ----------------
@@ -52,43 +44,28 @@ class PaperEngine:
 
         return df
 
-    # ---------------- MARKET FILTER ----------------
+    # ---------------- FIXED MARKET FILTER ----------------
     def market_ok(self):
+
         df = self.get_data("^NSEI")
         if df is None:
-            return False
+            return True  # don't block system
 
         df = self.apply_indicators(df)
         last = df.iloc[-1]
 
-        try:
-            return float(last["Close"]) > float(last["EMA20"])
-        except:
-            return False
+        close = float(last["Close"])
+        ema20 = float(last["EMA20"])
+        ema50 = float(last["EMA50"])
 
-    # ---------------- RELATIVE STRENGTH (RELAXED) ----------------
-    def relative_strength(self, df_stock, df_nifty):
-        try:
-            stock_ret = (df_stock["Close"].iloc[-20] - df_stock["Close"].iloc[-1]) * -1
-            nifty_ret = (df_nifty["Close"].iloc[-20] - df_nifty["Close"].iloc[-1]) * -1
-
-            return stock_ret > (nifty_ret - 0.02)
-        except:
-            return False
-
-    # ---------------- WEEKLY TREND (SOFT FILTER) ----------------
-    def weekly_trend_ok(self, symbol):
-        df = self.get_data(symbol, interval="1wk")
-        if df is None:
-            return True   # allow if data missing
-
-        df["EMA20"] = df["Close"].ewm(span=20).mean()
-        last = df.iloc[-1]
-
-        try:
-            return float(last["Close"]) > float(last["EMA20"])
-        except:
+        # flexible logic
+        if close > ema20:
             return True
+
+        if close > ema50:
+            return True
+
+        return False
 
     # ---------------- SIGNAL ----------------
     def generate_signal(self, df):
@@ -111,11 +88,11 @@ class PaperEngine:
         if not (45 < rsi < 70):
             return None
 
-        # REMOVE STRICT MOMENTUM BLOCK
+        # ENTRY
         if price < ema20:
             return None
 
-        # SL + RR
+        # RISK
         sl = price - (1.5 * atr)
         risk = price - sl
 
@@ -126,7 +103,7 @@ class PaperEngine:
 
         return price, sl, target
 
-    # ---------------- INSERT TRADE ----------------
+    # ---------------- INSERT ----------------
     def insert_trade(self, symbol, entry, sl, target):
 
         conn = get_conn()
@@ -145,7 +122,7 @@ class PaperEngine:
         conn.commit()
         conn.close()
 
-    # ---------------- UPDATE TRADES ----------------
+    # ---------------- UPDATE ----------------
     def update_trades(self):
 
         conn = get_conn()
@@ -198,10 +175,8 @@ class PaperEngine:
         self.update_trades()
 
         if not self.market_ok():
-            print("Market weak")
-            return []
+            print("Market slightly weak, but still scanning...")
 
-        df_nifty = self.get_data("^NSEI")
         results = []
 
         for sym in self.symbols:
@@ -209,13 +184,6 @@ class PaperEngine:
             df = self.get_data(sym)
             if df is None:
                 continue
-
-            if not self.relative_strength(df, df_nifty):
-                continue
-
-            # SOFT weekly filter (not blocking)
-            if not self.weekly_trend_ok(sym):
-                pass
 
             signal = self.generate_signal(df)
 
