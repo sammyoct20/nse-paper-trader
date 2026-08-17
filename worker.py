@@ -1,22 +1,10 @@
 from engine import PaperEngine
-import datetime
-import traceback
+from datetime import datetime
 
+print("🚀 Worker Started")
+print("Time:", datetime.now())
 
-def main():
+engine = PaperEngine()
+engine.run()
 
-    print("🚀 Worker Started")
-    print("Time:", datetime.datetime.now())
-
-    try:
-        engine = PaperEngine()
-        trades = engine.run_once()
-
-        print("Trades Found:", len(trades))
-
-    except Exception:
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()
+print("✅ Done")
