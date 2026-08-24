@@ -1,13 +1,18 @@
 import io
+import warnings
 import requests
 import pandas as pd
 import yfinance as yf
 import ta
 
+# Silence NumPy/Pandas deprecation warnings thrown by yfinance internals
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 class PaperEngine:
     """
-    Core trading engine containing paper trading methods, technical indicators,
-    Nifty 500 scanner routines, and stock diagnostic analyzers.
+    Core engine handling NSE stock data fetching, technical indicator calculations,
+    and trading strategy scanning.
     """
     def __init__(self, initial_balance=100000.0, risk_per_trade_pct=1.0):
         self.balance = initial_balance
@@ -32,7 +37,7 @@ class PaperEngine:
             df = pd.read_csv(io.StringIO(res.text))
             return [f"{symbol}.NS" for symbol in df['Symbol'].tolist()]
         except Exception as e:
-            print(f"[!] Warning: Could not fetch official NSE list ({e}). Falling back to liquid list.")
+            print(f"[!] Warning: Could not fetch official NSE list ({e}). Falling back to default list.")
             return [
                 "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
                 "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "AXISBANK.NS"
@@ -42,7 +47,7 @@ class PaperEngine:
         """Calculates indicators used across Intraday and Swing strategies."""
         df = df.copy()
         
-        # Moving Averages
+        # Exponential Moving Averages
         df['EMA_20'] = ta.trend.ema_indicator(df['Close'], window=20)
         df['EMA_50'] = ta.trend.ema_indicator(df['Close'], window=50)
         df['EMA_200'] = ta.trend.ema_indicator(df['Close'], window=200)
@@ -51,7 +56,7 @@ class PaperEngine:
         df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         
-        # Volume Profile
+        # Volume Indicators
         df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
         df['Vol_Surge'] = df['Volume'] > (df['Vol_SMA20'] * 1.5)
         
@@ -73,12 +78,28 @@ class PaperEngine:
         period = "5d" if mode == "INTRADAY" else "1y"
         risk_amount = self.balance * (self.risk_per_trade_pct / 100.0)
         
-        data = yf.download(tickers=tickers, period=period, interval=interval, group_by='ticker', threads=True)
+        # Key Fix: progress=False prevents yfinance terminal spam, threads=True speeds up bulk fetch
+        data = yf.download(
+            tickers=tickers, 
+            period=period, 
+            interval=interval, 
+            group_by='ticker', 
+            threads=True, 
+            progress=False
+        )
+        
         results = []
         
         for ticker in tickers:
             try:
-                df = data[ticker].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
+                # Handle single vs multi-index data structure returned by yfinance
+                if isinstance(data.columns, pd.MultiIndex):
+                    if ticker not in data.columns.levels[0]:
+                        continue
+                    df = data[ticker].dropna()
+                else:
+                    df = data.dropna()
+                    
                 if len(df) < 50:
                     continue
                     
@@ -86,7 +107,7 @@ class PaperEngine:
                 curr = df.iloc[-1]
                 prev = df.iloc[-2]
                 
-                # Turnover liquidity filter: Min ₹50 Lakhs
+                # Liquidity filter: Minimum ₹50 Lakhs turnover
                 if (curr['Close'] * curr['Vol_SMA20']) < 5_000_000:
                     continue
                     
@@ -142,68 +163,14 @@ class PaperEngine:
                 
         return pd.DataFrame(results)
 
-    def analyze_stock(self, symbol):
-        """Generates technical analysis metrics for a specific ticker."""
-        ticker_symbol = f"{symbol.upper()}.NS" if not symbol.endswith(".NS") else symbol.upper()
-        df = yf.download(ticker_symbol, period="1y", interval="1d")
-        
-        if df.empty:
-            return {"Error": "Symbol data not found."}
-            
-        df = self.calculate_indicators(df)
-        curr = df.iloc[-1]
-        
-        score = 0
-        reasons = []
-        
-        if curr['Close'] > curr['EMA_200']:
-            score += 25
-            reasons.append("✓ Price above 200-day EMA (Bullish Macro Trend)")
-        else:
-            reasons.append("✗ Price below 200-day EMA (Bearish Macro Trend)")
-            
-        if curr['EMA_20'] > curr['EMA_50']:
-            score += 25
-            reasons.append("✓ 20 EMA > 50 EMA (Short-term Uptrend)")
-        else:
-            reasons.append("✗ 20 EMA < 50 EMA (Short-term Downtrend)")
-            
-        if 50 <= curr['RSI'] <= 70:
-            score += 25
-            reasons.append(f"✓ RSI at {round(curr['RSI'], 1)} (Strong Momentum)")
-        else:
-            reasons.append(f"✗ RSI at {round(curr['RSI'], 1)} (Weak Momentum)")
-            
-        if curr['Volume'] > curr['Vol_SMA20']:
-            score += 25
-            reasons.append("✓ Above Average Daily Volume")
-        else:
-            reasons.append("✗ Below Average Daily Volume")
-            
-        return {
-            "Symbol": ticker_symbol,
-            "Score": score,
-            "Price": round(curr['Close'], 2),
-            "EMA_200": round(curr['EMA_200'], 2),
-            "ATR": round(curr['ATR'], 2),
-            "Reasons": reasons,
-            "StopLoss": round(curr['Close'] - (2 * curr['ATR']), 2),
-            "Target": round(curr['Close'] + (4 * curr['ATR']), 2)
-        }
-
     def run(self):
-        """
-        Main execution method called by app.py when starting the application or engine loop.
-        """
-        print("[*] PaperEngine runner initialized.")
+        """Main execution interface."""
         universe = self.fetch_nse_universe("NIFTY 500")
-        
-        # Populate internal scan results for Streamlit app consumption
         self.swing_results = self.scan_markets(universe, mode="SWING")
         self.intraday_results = self.scan_markets(universe, mode="INTRADAY")
         
         return {
-            "status": "Engine executed successfully",
+            "status": "Success",
             "swing_candidates": self.swing_results,
             "intraday_candidates": self.intraday_results
         }
