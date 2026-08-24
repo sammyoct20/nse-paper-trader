@@ -6,7 +6,7 @@ from engine import PaperEngine
 st.set_page_config(layout="wide")
 create_tables()
 
-st.title("📊 Trading Dashboard - Sammy")
+st.title("📊 Trading Dashboard")
 
 engine = PaperEngine()
 
@@ -38,7 +38,9 @@ closed_df = df[df["status"]=="CLOSED"]
 intraday_df = open_df[open_df["type"]=="INTRADAY"]
 swing_df = open_df[open_df["type"]=="SWING"]
 
-tab1, tab2, tab3, tab4 = st.tabs(["⚡ Intraday","📈 Swing","📁 Closed","📊 Performance"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["⚡ Intraday","📈 Swing","📁 Closed","📊 Performance","🔍 Analyzer"]
+)
 
 with tab1:
     st.dataframe(intraday_df, use_container_width=True)
@@ -53,3 +55,14 @@ with tab4:
     if not closed_df.empty:
         st.metric("Total PnL", round(closed_df["pnl"].sum(),2))
         st.metric("Win Rate", round((closed_df["pnl"]>0).mean()*100,2))
+
+with tab5:
+    symbol = st.text_input("Enter Stock")
+
+    if st.button("Analyze"):
+        result = engine.analyze_stock(symbol)
+
+        if "error" in result:
+            st.error(result["error"])
+        else:
+            st.write(result)
