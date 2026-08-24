@@ -1,80 +1,59 @@
 import streamlit as st
 import pandas as pd
-from db import get_conn, create_tables
 from engine import PaperEngine
 
-st.set_page_config(layout="wide")
-create_tables()
+st.set_page_config(page_title="NSE Strategy Scanner", layout="wide")
 
-st.title("📊 Enhanced Trading Dashboard")
+st.title("📈 Active Trading & Market Scanner Engine")
 
-engine = PaperEngine()
+# Initialize engine instance in session state
+if "engine" not in st.session_state:
+    st.session_state.engine = PaperEngine()
 
-if st.button("🚀 Run Scanner"):
-    engine.run()
-    st.success("Scanner executed with updated multi-parameter model.")
+# Use Streamlit caching so user interactions do not trigger re-downloads
+@st.cache_data(ttl=900)  # Cache data for 15 minutes
+def run_cached_scan(index_name="NIFTY 50"):
+    engine = st.session_state.engine
+    tickers = engine.fetch_nse_universe(index_name)
+    
+    # Run scan on fetched tickers
+    swing_df = engine.scan_markets(tickers=tickers, mode="SWING")
+    intraday_df = engine.scan_markets(tickers=tickers, mode="INTRADAY")
+    
+    return swing_df, intraday_df
 
-conn = get_conn()
-df = pd.read_sql("SELECT * FROM trades", conn)
-conn.close()
+# Sidebar Controls
+st.sidebar.header("Scan Settings")
+selected_index = st.sidebar.selectbox("Select Index Universe", ["NIFTY 50", "NIFTY NEXT 50", "NIFTY 500"], index=0)
 
-def clean(df_in):
-    if df_in.empty:
-        return df_in
+if st.sidebar.button("🚀 Run Market Scan"):
+    with st.spinner(f"Scanning {selected_index} stocks... Please wait."):
+        swing_df, intraday_df = run_cached_scan(selected_index)
+        st.session_state["swing_results"] = swing_df
+        st.session_state["intraday_results"] = intraday_df
+    st.success("Scan Complete!")
 
-    df_in["symbol"] = df_in["symbol"].astype(str).str.replace(".NS", "", regex=False)
-    num_cols = ["entry", "sl", "target", "entry_price", "exit_price", "pnl", "atr", "adx", "volume_ratio"]
-    for col in num_cols:
-        if col in df_in.columns:
-            df_in[col] = pd.to_numeric(df_in[col], errors="coerce").round(2)
-
-    return df_in
-
-df = clean(df)
-
-open_df = df[df["status"] == "OPEN"] if not df.empty else pd.DataFrame()
-closed_df = df[df["status"] == "CLOSED"] if not df.empty else pd.DataFrame()
-
-intraday_df = open_df[open_df["type"] == "INTRADAY"] if not open_df.empty else pd.DataFrame()
-swing_df = open_df[open_df["type"] == "SWING"] if not open_df.empty else pd.DataFrame()
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["⚡ Intraday", "📈 Swing", "📁 Closed", "📊 Performance", "🔍 Stock Analyzer"]
-)
+# Display Results
+tab1, tab2 = st.tabs(["Swing Setups", "Intraday Setups"])
 
 with tab1:
-    st.dataframe(intraday_df, use_container_width=True)
+    st.subheader("Swing Candidates")
+    if "swing_results" in st.session_state:
+        df = st.session_state["swing_results"]
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No swing candidates matched current technical criteria.")
+    else:
+        st.write("Click 'Run Market Scan' in the sidebar to fetch setups.")
 
 with tab2:
-    st.dataframe(swing_df, use_container_width=True)
-
-with tab3:
-    st.dataframe(closed_df, use_container_width=True)
-
-with tab4:
-    if not closed_df.empty:
-        col1, col2 = st.columns(2)
-        col1.metric("Total PnL", f"₹{round(closed_df['pnl'].sum(), 2)}")
-        col2.metric("Win Rate", f"{round((closed_df['pnl'] > 0).mean() * 100, 2)}%")
-    else:
-        st.info("No closed trades recorded yet.")
-
-with tab5:
-    symbol = st.text_input("Enter NSE/BSE Symbol (e.g. ICICIBANK, TATAMOTORS)").strip()
-
-    if st.button("Analyze Stock"):
-        if symbol:
-            result = engine.analyze_stock(symbol)
-            if "error" in result:
-                st.error(result["error"])
-            else:
-                st.subheader(f"Analysis Results for {result['symbol']}")
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Price", f"₹{result['price']}")
-                col2.metric("Action", result["action"])
-                col3.metric("ADX (Trend Power)", result["ADX"])
-                col4.metric("Vol Multiplier", result["volume_multiplier"])
-
-                st.json(result)
+    st.subheader("Intraday Candidates")
+    if "intraday_results" in st.session_state:
+        df = st.session_state["intraday_results"]
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
         else:
-            st.warning("Please specify a stock ticker symbol.")
+            st.info("No intraday candidates matched current technical criteria.")
+    else:
+        st.write("Click 'Run Market Scan' in the sidebar to fetch setups.")
