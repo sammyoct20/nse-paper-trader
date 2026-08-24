@@ -23,6 +23,9 @@ def create_tables():
         type TEXT,
         direction TEXT,
         exit_reason TEXT,
+        atr REAL,
+        adx REAL,
+        volume_ratio REAL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         closed_at TIMESTAMP
     )
