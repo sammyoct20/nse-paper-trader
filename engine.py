@@ -1,40 +1,20 @@
-import sys
-import subprocess
 import io
-
-# ==========================================
-# 0. AUTOMATIC DEPENDENCY MANAGEMENT
-# ==========================================
-REQUIRED_PACKAGES = ["pandas", "yfinance", "requests", "ta"]
-
-def install_and_import(package):
-    """Auto-installs missing libraries on host environments like Render."""
-    try:
-        __import__(package)
-    except ImportError:
-        print(f"[!] Auto-installing missing dependency: '{package}'...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-for pkg in REQUIRED_PACKAGES:
-    install_and_import(pkg)
-
 import requests
 import pandas as pd
 import yfinance as yf
 import ta
 
-# ==========================================
-# 1. CORE ENGINE CLASS (EXPECTED BY APP.PY)
-# ==========================================
 class PaperEngine:
     """
-    Main execution engine containing technical scanner routines,
-    indicator calculation pipelines, and single-stock analysis methods.
+    Core trading engine containing paper trading methods, technical indicators,
+    Nifty 500 scanner routines, and stock diagnostic analyzers.
     """
     def __init__(self, initial_balance=100000.0, risk_per_trade_pct=1.0):
         self.balance = initial_balance
         self.risk_per_trade_pct = risk_per_trade_pct
         self.positions = {}
+        self.swing_results = pd.DataFrame()
+        self.intraday_results = pd.DataFrame()
 
     def fetch_nse_universe(self, index_name="NIFTY 500"):
         """Downloads active stock list from NSE archives appended with '.NS'."""
@@ -52,7 +32,7 @@ class PaperEngine:
             df = pd.read_csv(io.StringIO(res.text))
             return [f"{symbol}.NS" for symbol in df['Symbol'].tolist()]
         except Exception as e:
-            print(f"[!] Warning: Could not fetch official NSE list ({e}). Falling back to core list.")
+            print(f"[!] Warning: Could not fetch official NSE list ({e}). Falling back to liquid list.")
             return [
                 "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
                 "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "AXISBANK.NS"
@@ -62,22 +42,20 @@ class PaperEngine:
         """Calculates indicators used across Intraday and Swing strategies."""
         df = df.copy()
         
-        # Exponential Moving Averages
+        # Moving Averages
         df['EMA_20'] = ta.trend.ema_indicator(df['Close'], window=20)
         df['EMA_50'] = ta.trend.ema_indicator(df['Close'], window=50)
         df['EMA_200'] = ta.trend.ema_indicator(df['Close'], window=200)
         
-        # Relative Strength Index
+        # Momentum & Volatility
         df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
-        
-        # Average True Range (Volatility)
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         
-        # Volume Indicators
+        # Volume Profile
         df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
         df['Vol_Surge'] = df['Volume'] > (df['Vol_SMA20'] * 1.5)
         
-        # VWAP
+        # VWAP Approximation
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3
         df['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
         
@@ -87,9 +65,7 @@ class PaperEngine:
         return df
 
     def scan_markets(self, tickers=None, mode="SWING"):
-        """
-        Scans given universe (or defaults to Nifty 500) for trade setups.
-        """
+        """Scans specified stock universe for intraday or swing setups."""
         if tickers is None:
             tickers = self.fetch_nse_universe("NIFTY 500")
             
@@ -213,4 +189,21 @@ class PaperEngine:
             "Reasons": reasons,
             "StopLoss": round(curr['Close'] - (2 * curr['ATR']), 2),
             "Target": round(curr['Close'] + (4 * curr['ATR']), 2)
+        }
+
+    def run(self):
+        """
+        Main execution method called by app.py when starting the application or engine loop.
+        """
+        print("[*] PaperEngine runner initialized.")
+        universe = self.fetch_nse_universe("NIFTY 500")
+        
+        # Populate internal scan results for Streamlit app consumption
+        self.swing_results = self.scan_markets(universe, mode="SWING")
+        self.intraday_results = self.scan_markets(universe, mode="INTRADAY")
+        
+        return {
+            "status": "Engine executed successfully",
+            "swing_candidates": self.swing_results,
+            "intraday_candidates": self.intraday_results
         }
