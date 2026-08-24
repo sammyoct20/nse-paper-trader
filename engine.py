@@ -30,6 +30,7 @@ class PaperEngine:
                 df.columns = df.columns.get_level_values(0)
 
             return df
+
         except:
             return None
 
@@ -43,29 +44,50 @@ class PaperEngine:
 
     # ---------------- INDICATORS ----------------
     def apply_indicators(self, df):
+        df = df.copy()
+
         df["EMA20"] = df["Close"].ewm(span=20).mean()
         df["EMA50"] = df["Close"].ewm(span=50).mean()
 
         delta = df["Close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+
         rs = gain / loss
         df["RSI"] = 100 - (100 / (1 + rs))
 
         df["ATR"] = (df["High"] - df["Low"]).rolling(14).mean()
 
+        # SAFE volume handling
+        if "Volume" in df.columns:
+            df["vol_avg"] = df["Volume"].rolling(20).mean()
+        else:
+            df["vol_avg"] = None
+
         return df
+
+    # ---------------- VALIDATION ----------------
+    def validate_df(self, df):
+        required = ["Open", "High", "Low", "Close"]
+        return df is not None and not df.empty and all(c in df.columns for c in required)
 
     # ---------------- SWING ----------------
     def swing_signal(self, df):
         df = self.apply_indicators(df)
+
+        if len(df) < 60:
+            return None
+
         last = df.iloc[-1]
 
         price = float(last["Close"])
         ema20 = float(last["EMA20"])
         ema50 = float(last["EMA50"])
-        rsi = float(last["RSI"])
-        atr = float(last["ATR"])
+        rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
+        atr = float(last["ATR"]) if not pd.isna(last["ATR"]) else 0
+
+        if atr == 0:
+            return None
 
         if not (price > ema20 > ema50):
             return None
@@ -117,8 +139,6 @@ class PaperEngine:
             conn.close()
             return
 
-        print(f"Inserted {symbol} | {ttype}")
-
         cur.execute("""
         INSERT INTO trades 
         (symbol, entry, sl, target, status, entry_price, type, direction)
@@ -147,7 +167,7 @@ class PaperEngine:
             else:
                 df = self.get_data(symbol)
 
-            if df is None:
+            if df is None or df.empty:
                 continue
 
             last = df.iloc[-1]
@@ -166,8 +186,6 @@ class PaperEngine:
                 reason = "TARGET HIT"
 
             if exit_price:
-                print(f"Closed {symbol} | {reason}")
-
                 pnl = exit_price - entry
 
                 cur.execute("""
@@ -187,15 +205,14 @@ class PaperEngine:
     def analyze_stock(self, symbol):
 
         symbol = self.format_symbol(symbol)
-
         df = self.get_data(symbol)
 
         if df is None or df.empty:
             symbol = symbol.replace(".NS", ".BO")
             df = self.get_data(symbol)
 
-        if df is None or len(df) < 100:
-            return {"error": "Not enough data"}
+        if not self.validate_df(df) or len(df) < 100:
+            return {"error": "Invalid or insufficient data"}
 
         df = self.apply_indicators(df)
         last = df.iloc[-1]
@@ -203,13 +220,14 @@ class PaperEngine:
         price = float(last["Close"])
         ema20 = float(last["EMA20"])
         ema50 = float(last["EMA50"])
-        rsi = float(last["RSI"])
+        rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
 
-        df["vol_avg"] = df["Volume"].rolling(20).mean()
-        vol = float(last["Volume"])
-        vol_avg = float(last["vol_avg"])
+        df["vol_avg"] = df["Volume"].rolling(20).mean() if "Volume" in df.columns else 0
 
-        volume_strength = "HIGH" if vol > 1.5 * vol_avg else "LOW"
+        vol = float(last["Volume"]) if "Volume" in df.columns else 0
+        vol_avg = float(df["vol_avg"].iloc[-1]) if "Volume" in df.columns else 0
+
+        volume_strength = "HIGH" if vol_avg and vol > 1.5 * vol_avg else "LOW"
 
         resistance = df["High"].rolling(20).max().iloc[-1]
         support = df["Low"].rolling(20).min().iloc[-1]
@@ -245,7 +263,6 @@ class PaperEngine:
 
         self.update_trades()
 
-        # Swing
         for sym in self.swing_symbols:
             df = self.get_data(sym)
             if df is None:
@@ -256,7 +273,6 @@ class PaperEngine:
                 entry, sl, target = sig
                 self.insert_trade(sym, entry, sl, target, "SWING", "BUY")
 
-        # Intraday
         intraday = self.intraday_signal()
         if intraday:
             symbol, direction, entry, sl, target = intraday
