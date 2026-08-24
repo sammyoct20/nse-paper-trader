@@ -4,3 +4,4 @@ numpy>=1.26,<3
 requests>=2.31,<3
 psycopg2-binary>=2.9,<3
 yfinance>=0.2,<1
+ta>=0.10.0,<1
