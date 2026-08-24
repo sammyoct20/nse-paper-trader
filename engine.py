@@ -1,307 +1,281 @@
-import yfinance as yf
+import sys
+import subprocess
+
+# ==========================================
+# 0. DEPENDENCY CHECK & AUTO-INSTALLATION
+# ==========================================
+REQUIRED_PACKAGES = ["pandas", "yfinance", "requests", "ta"]
+
+def install_and_import(package):
+    """Ensures required packages are installed before importing."""
+    try:
+        __import__(package)
+    except ImportError:
+        print(f"[!] Package '{package}' not found. Auto-installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+for pkg in REQUIRED_PACKAGES:
+    install_and_import(pkg)
+
+# --- Standard Library Imports ---
+import io
+import requests
 import pandas as pd
-import numpy as np
-from db import get_conn, create_tables
+import yfinance as yf
+import ta
 
-class PaperEngine:
-
-    def __init__(self):
-        create_tables()
-        self.swing_symbols = [
-            "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "TATAMOTORS.NS"
+# ==========================================
+# 1. DYNAMIC NSE TICKER FETCHING
+# ==========================================
+def fetch_nse_universe(index_name="NIFTY 500"):
+    """
+    Downloads official Nifty stock lists directly from NSE archives
+    and formats them for yfinance with '.NS'.
+    """
+    urls = {
+        "NIFTY 50": "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
+        "NIFTY NEXT 50": "https://archives.nseindia.com/content/indices/ind_niftynext50list.csv",
+        "NIFTY 500": "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+    }
+    
+    url = urls.get(index_name, urls["NIFTY 500"])
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        res.raise_for_status()
+        df = pd.read_csv(io.StringIO(res.text))
+        tickers = [f"{symbol}.NS" for symbol in df['Symbol'].tolist()]
+        print(f"[+] Successfully loaded {len(tickers)} active tickers for {index_name}.")
+        return tickers
+    except Exception as e:
+        print(f"[!] Warning: Could not fetch official NSE list ({e}). Using core fallback liquid tickers.")
+        return [
+            "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
+            "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "AXISBANK.NS"
         ]
 
-    # ---------------- DATA RETRIEVAL ----------------
-    def get_data(self, symbol, interval="1d", period="1y"):
+# ==========================================
+# 2. TECHNICAL INDICATOR ENGINE
+# ==========================================
+def calculate_indicators(df):
+    """Calculates high-confluence technical indicators."""
+    df = df.copy()
+    
+    # Exponential Moving Averages
+    df['EMA_20'] = ta.trend.ema_indicator(df['Close'], window=20)
+    df['EMA_50'] = ta.trend.ema_indicator(df['Close'], window=50)
+    df['EMA_200'] = ta.trend.ema_indicator(df['Close'], window=200)
+    
+    # Relative Strength Index (RSI)
+    df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
+    
+    # Average True Range (ATR) for Volatility Sizing
+    df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+    
+    # Volume Profiles
+    df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
+    df['Vol_Surge'] = df['Volume'] > (df['Vol_SMA20'] * 1.5)
+    
+    # Volume-Weighted Average Price (VWAP)
+    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+    df['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+    
+    # Breakout Benchmarks
+    df['High_20'] = df['High'].rolling(20).max()
+    
+    return df
+
+# ==========================================
+# 3. CONFLUENCE MARKET SCANNER
+# ==========================================
+def scan_markets(tickers, mode="SWING", total_capital=100000, risk_per_trade_pct=1.0):
+    """
+    Scans the NSE universe for high-win-rate setups with automated position sizing.
+    
+    Parameters:
+      - mode: 'SWING' (1d candles) or 'INTRADAY' (15m candles)
+      - total_capital: Your total trading equity in INR (₹)
+      - risk_per_trade_pct: Maximum account equity percentage risked per trade
+    """
+    interval = "15m" if mode == "INTRADAY" else "1d"
+    period = "5d" if mode == "INTRADAY" else "1y"
+    risk_amount = total_capital * (risk_per_trade_pct / 100.0)
+    
+    print(f"\n[*] Scanning {mode} setups across {len(tickers)} stocks...")
+    data = yf.download(tickers=tickers, period=period, interval=interval, group_by='ticker', threads=True)
+    
+    results = []
+    
+    for ticker in tickers:
         try:
-            df = yf.download(
-                symbol,
-                period=period,
-                interval=interval,
-                progress=False,
-                auto_adjust=True
-            )
-
-            if df is None or df.empty:
-                return None
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            return df
+            df = data[ticker].dropna()
+            if len(df) < 50:
+                continue
+                
+            df = calculate_indicators(df)
+            curr = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            # Liquidity Filter: Daily turnover check (Min ₹50 Lakhs)
+            if (curr['Close'] * curr['Vol_SMA20']) < 5_000_000:
+                continue
+                
+            if mode == "SWING":
+                # High-Win Rate Criteria:
+                # 1. Trend: EMA 20 > 50 & Price > 200 EMA
+                # 2. RSI: Bullish momentum zone (55 to 70)
+                # 3. Volume: Volume > 1.5x 20-period average
+                # 4. Price near 20-day High
+                cond_trend = (curr['EMA_20'] > curr['EMA_50']) and (curr['Close'] > curr['EMA_200'])
+                cond_rsi = 55 <= curr['RSI'] <= 70
+                cond_vol = curr['Vol_Surge']
+                cond_breakout = curr['Close'] >= (prev['High_20'] * 0.995)
+                
+                if cond_trend and cond_rsi and cond_vol and cond_breakout:
+                    entry = curr['Close']
+                    sl = entry - (2 * curr['ATR'])
+                    target = entry + (4 * curr['ATR'])  # 1:2 Risk-Reward Ratio
+                    risk_per_share = entry - sl
+                    
+                    # Calculated position sizing based on risk limit
+                    qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
+                    
+                    results.append({
+                        "Ticker": ticker.replace(".NS", ""),
+                        "Price (₹)": round(entry, 2),
+                        "RSI": round(curr['RSI'], 1),
+                        "Vol_Mult": round(curr['Volume'] / curr['Vol_SMA20'], 2),
+                        "StopLoss (₹)": round(sl, 2),
+                        "Target (₹)": round(target, 2),
+                        "Qty (Shares)": qty,
+                        "Est. Position (₹)": round(qty * entry, 2)
+                    })
+                    
+            elif mode == "INTRADAY":
+                # High-Win Rate Intraday Criteria:
+                # 1. Price above VWAP and 20 EMA
+                # 2. RSI > 58
+                # 3. Volume > 1.8x average
+                cond_vwap = curr['Close'] > curr['VWAP']
+                cond_ema = curr['Close'] > curr['EMA_20']
+                cond_rsi = curr['RSI'] > 58
+                cond_vol = curr['Volume'] > (curr['Vol_SMA20'] * 1.8)
+                
+                if cond_vwap and cond_ema and cond_rsi and cond_vol:
+                    entry = curr['Close']
+                    sl = entry - (1.5 * curr['ATR'])
+                    target = entry + (3.0 * curr['ATR'])
+                    risk_per_share = entry - sl
+                    
+                    qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
+                    
+                    results.append({
+                        "Ticker": ticker.replace(".NS", ""),
+                        "Price (₹)": round(entry, 2),
+                        "RSI": round(curr['RSI'], 1),
+                        "VWAP (₹)": round(curr['VWAP'], 2),
+                        "StopLoss (₹)": round(sl, 2),
+                        "Target (₹)": round(target, 2),
+                        "Qty (Shares)": qty,
+                        "Est. Position (₹)": round(qty * entry, 2)
+                    })
+                    
         except Exception:
-            return None
+            continue
+            
+    return pd.DataFrame(results)
 
-    def format_symbol(self, symbol):
-        symbol = symbol.upper().strip()
-        if symbol.endswith(".NS") or symbol.endswith(".BO") or symbol == "^NSEI":
-            return symbol
-        return symbol + ".NS"
+# ==========================================
+# 4. SINGLE STOCK ANALYZER
+# ==========================================
+def analyze_stock(symbol):
+    """Executes a diagnostic technical evaluation for a single NSE stock ticker."""
+    ticker_symbol = f"{symbol.upper()}.NS" if not symbol.endswith(".NS") else symbol.upper()
+    print(f"\n==========================================")
+    print(f"      SINGLE STOCK DIAGNOSTIC: {ticker_symbol}     ")
+    print(f"==========================================")
+    
+    df = yf.download(ticker_symbol, period="1y", interval="1d")
+    if df.empty:
+        print("[!] Symbol data not found.")
+        return
+        
+    df = calculate_indicators(df)
+    curr = df.iloc[-1]
+    
+    score = 0
+    reasons = []
+    
+    # 200 EMA Macro Trend Test
+    if curr['Close'] > curr['EMA_200']:
+        score += 25
+        reasons.append("✓ Price above 200-day EMA (Long-term Bullish)")
+    else:
+        reasons.append("✗ Price below 200-day EMA (Long-term Bearish)")
+        
+    # Moving Average Alignment Test
+    if curr['EMA_20'] > curr['EMA_50']:
+        score += 25
+        reasons.append("✓ 20 EMA > 50 EMA (Short-term Uptrend Alignment)")
+    else:
+        reasons.append("✗ 20 EMA < 50 EMA (Short-term Downtrend Alignment)")
+        
+    # RSI Momentum Test
+    if 50 <= curr['RSI'] <= 70:
+        score += 25
+        reasons.append(f"✓ RSI at {round(curr['RSI'], 1)} (Strong Momentum Zone)")
+    elif curr['RSI'] > 70:
+        score += 10
+        reasons.append(f"⚠️ RSI at {round(curr['RSI'], 1)} (Overbought Zone)")
+    else:
+        reasons.append(f"✗ RSI at {round(curr['RSI'], 1)} (Weak Momentum)")
+        
+    # Institutional Volume Test
+    if curr['Volume'] > curr['Vol_SMA20']:
+        score += 25
+        reasons.append("✓ Volume exceeds 20-day Average")
+    else:
+        reasons.append("✗ Volume below 20-day Average")
+        
+    print(f"Overall Technical Score: {score}/100")
+    print(f"Current Price:           ₹{round(curr['Close'], 2)}")
+    print(f"200-day EMA:             ₹{round(curr['EMA_200'], 2)}")
+    print(f"14-day ATR:              ₹{round(curr['ATR'], 2)}")
+    print("\nDetailed Diagnostic Breakdown:")
+    for r in reasons:
+        print(f"  {r}")
+        
+    print("\nTrade Execution Levels:")
+    print(f"  Stop Loss (2x ATR):                  ₹{round(curr['Close'] - (2 * curr['ATR']), 2)}")
+    print(f"  Target Level (1:2 Risk/Reward):     ₹{round(curr['Close'] + (4 * curr['ATR']), 2)}")
 
-    # ---------------- INDICATOR CALCULATIONS ----------------
-    def apply_indicators(self, df):
-        df = df.copy()
-
-        # Moving Averages
-        df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-        df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-        df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
-
-        # RSI
-        delta = df["Close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / (loss.replace(0, np.nan))
-        df["RSI"] = 100 - (100 / (1 + rs))
-
-        # MACD
-        ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-        ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-        df["MACD"] = ema12 - ema26
-        df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-        df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
-
-        # ATR (Average True Range)
-        high_low = df["High"] - df["Low"]
-        high_cp = (df["High"] - df["Close"].shift(1)).abs()
-        low_cp = (df["Low"] - df["Close"].shift(1)).abs()
-        tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
-        df["ATR"] = tr.rolling(14).mean()
-
-        # ADX (Average Directional Index)
-        up_move = df["High"].diff()
-        down_move = df["Low"].shift(1) - df["Low"]
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-        tr_smooth = tr.rolling(14).sum()
-        plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(14).sum() / tr_smooth)
-        minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(14).sum() / tr_smooth)
-
-        dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-        df["ADX"] = dx.rolling(14).mean()
-
-        # Volume Metrics
-        if "Volume" in df.columns:
-            df["vol_sma20"] = df["Volume"].rolling(20).mean()
-            df["vol_multiplier"] = df["Volume"] / df["vol_sma20"].replace(0, np.nan)
-        else:
-            df["vol_sma20"] = 0
-            df["vol_multiplier"] = 0.0
-
-        return df
-
-    def validate_df(self, df):
-        required = ["Open", "High", "Low", "Close"]
-        return df is not None and not df.empty and all(c in df.columns for c in required)
-
-    def get_market_trend(self):
-        nifty_df = self.get_data("^NSEI", interval="1d", period="6mo")
-        if nifty_df is None or len(nifty_df) < 50:
-            return "NEUTRAL"
-        nifty_df = self.apply_indicators(nifty_df)
-        last = nifty_df.iloc[-1]
-        if last["Close"] > last["EMA50"]:
-            return "BULLISH"
-        elif last["Close"] < last["EMA50"]:
-            return "BEARISH"
-        return "NEUTRAL"
-
-    # ---------------- SIGNALS ----------------
-    def swing_signal(self, df):
-        df = self.apply_indicators(df)
-        if len(df) < 200:
-            return None
-
-        last = df.iloc[-1]
-
-        price = float(last["Close"])
-        ema20 = float(last["EMA20"])
-        ema50 = float(last["EMA50"])
-        ema200 = float(last["EMA200"])
-        rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
-        adx = float(last["ADX"]) if not pd.isna(last["ADX"]) else 0
-        atr = float(last["ATR"]) if not pd.isna(last["ATR"]) else 0
-        vol_mult = float(last["vol_multiplier"]) if not pd.isna(last["vol_multiplier"]) else 0
-        macd_hist = float(last["MACD_hist"]) if not pd.isna(last["MACD_hist"]) else 0
-
-        if atr == 0:
-            return None
-
-        # Enhanced Institutional Entry Conditions
-        macro_uptrend = price > ema200
-        short_momentum = price > ema20 > ema50
-        trend_strong = adx > 20
-        rsi_healthy = 48 < rsi < 68
-        volume_confirmed = vol_mult >= 1.2
-        macd_positive = macd_hist > 0
-
-        if macro_uptrend and short_momentum and trend_strong and rsi_healthy and volume_confirmed and macd_positive:
-            sl = price - (1.5 * atr)
-            target = price + ((price - sl) * 2.0)
-            return price, sl, target, atr, adx, vol_mult
-
-        return None
-
-    def intraday_signal(self):
-        df = self.get_data("^NSEI", interval="5m", period="5d")
-        if df is None or len(df) < 30:
-            return None
-
-        df = self.apply_indicators(df)
-        orb = df.between_time("09:15", "09:30")
-        if orb.empty:
-            return None
-
-        orb_high = orb["High"].max()
-        orb_low = orb["Low"].min()
-
-        last = df.iloc[-1]
-        price = float(last["Close"])
-        vwap = (df["Volume"] * (df["High"] + df["Low"] + df["Close"]) / 3).sum() / df["Volume"].sum() if "Volume" in df.columns else price
-
-        if price > orb_high and price > vwap:
-            sl = orb_low
-            target = price + (price - sl) * 2.0
-            return "NIFTY", "CALL", price, sl, target
-        elif price < orb_low and price < vwap:
-            sl = orb_high
-            target = price - (sl - price) * 2.0
-            return "NIFTY", "PUT", price, sl, target
-
-        return None
-
-    # ---------------- DB OPERATIONS ----------------
-    def insert_trade(self, symbol, entry, sl, target, ttype, direction, atr=0, adx=0, vol_ratio=0):
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("SELECT * FROM trades WHERE symbol=? AND status='OPEN' AND type=?", (symbol, ttype))
-        if cur.fetchone():
-            conn.close()
-            return
-
-        cur.execute("""
-        INSERT INTO trades 
-        (symbol, entry, sl, target, status, entry_price, type, direction, atr, adx, volume_ratio)
-        VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
-        """, (symbol, entry, sl, target, entry, ttype, direction, atr, adx, vol_ratio))
-
-        conn.commit()
-        conn.close()
-
-    def update_trades(self):
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("SELECT id, symbol, entry_price, sl, target FROM trades WHERE status='OPEN'")
-        for trade in cur.fetchall():
-            trade_id, symbol, entry, sl, target = trade
-            df = self.get_data("^NSEI" if symbol == "NIFTY" else symbol)
-
-            if df is None or df.empty:
-                continue
-
-            last = df.iloc[-1]
-            high = float(last["High"])
-            low = float(last["Low"])
-
-            exit_price = None
-            reason = None
-
-            if low <= sl:
-                exit_price = sl
-                reason = "SL HIT"
-            elif high >= target:
-                exit_price = target
-                reason = "TARGET HIT"
-
-            if exit_price:
-                pnl = (exit_price - entry) if target > entry else (entry - exit_price)
-                cur.execute("""
-                UPDATE trades SET status='CLOSED', exit_price=?, pnl=?, exit_reason=?, closed_at=CURRENT_TIMESTAMP
-                WHERE id=?
-                """, (exit_price, pnl, reason, trade_id))
-
-        conn.commit()
-        conn.close()
-
-    # ---------------- ENHANCED ANALYZER ----------------
-    def analyze_stock(self, symbol):
-        symbol = self.format_symbol(symbol)
-        df = self.get_data(symbol)
-
-        if df is None or df.empty:
-            symbol = symbol.replace(".NS", ".BO")
-            df = self.get_data(symbol)
-
-        if not self.validate_df(df) or len(df) < 100:
-            return {"error": "Invalid or insufficient data"}
-
-        df = self.apply_indicators(df)
-        last = df.iloc[-1]
-
-        price = float(last["Close"])
-        ema20 = float(last["EMA20"])
-        ema50 = float(last["EMA50"])
-        ema200 = float(last["EMA200"])
-        rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
-        adx = float(last["ADX"]) if not pd.isna(last["ADX"]) else 0
-        atr = float(last["ATR"]) if not pd.isna(last["ATR"]) else 0
-        macd_hist = float(last["MACD_hist"]) if not pd.isna(last["MACD_hist"]) else 0
-        vol_mult = float(last["vol_multiplier"]) if not pd.isna(last["vol_multiplier"]) else 0
-
-        resistance = df["High"].rolling(20).max().iloc[-1]
-        support = df["Low"].rolling(20).min().iloc[-1]
-
-        breakout = price > resistance
-        breakout_strength = "STRONG" if breakout and vol_mult > 1.5 else ("WEAK" if breakout else "NONE")
-        market_trend = self.get_market_trend()
-
-        action = "HOLD"
-        if price > ema200 and price > ema20 > ema50 and rsi > 50 and adx > 20 and vol_mult >= 1.3 and macd_hist > 0:
-            action = "STRONG BUY"
-        elif price > ema20 > ema50 and rsi > 45:
-            action = "BUY"
-        elif price < ema50 or rsi < 35:
-            action = "EXIT"
-
-        return {
-            "symbol": symbol.replace(".NS", "").replace(".BO", ""),
-            "price": round(price, 2),
-            "RSI": round(rsi, 2),
-            "ADX": round(adx, 2),
-            "ATR": round(atr, 2),
-            "EMA20": round(ema20, 2),
-            "EMA50": round(ema50, 2),
-            "EMA200": round(ema200, 2),
-            "support": round(support, 2),
-            "resistance": round(resistance, 2),
-            "volume_multiplier": f"{round(vol_mult, 2)}x",
-            "breakout": breakout,
-            "breakout_strength": breakout_strength,
-            "market_trend": market_trend,
-            "action": action
-        }
-
-    # ---------------- RUNNER ----------------
-    def run(self):
-        self.update_trades()
-
-        for sym in self.swing_symbols:
-            df = self.get_data(sym)
-            if df is None:
-                continue
-
-            sig = self.swing_signal(df)
-            if sig:
-                entry, sl, target, atr, adx, vol_mult = sig
-                self.insert_trade(sym, entry, sl, target, "SWING", "BUY", atr, adx, vol_mult)
-
-        intraday = self.intraday_signal()
-        if intraday:
-            symbol, direction, entry, sl, target = intraday
-            self.insert_trade(symbol, entry, sl, target, "INTRADAY", direction)
-
-    def run_once(self):
-        self.run()
+# ==========================================
+# 5. MAIN EXECUTION ENTRY POINT
+# ==========================================
+if __name__ == "__main__":
+    # Assumptions for default risk calculation
+    TOTAL_CAPITAL = 100000       # ₹1,00,000 Portfolio
+    RISK_PER_TRADE_PCT = 1.0     # Risk 1.0% (₹1,000) per trade
+    
+    # Fetch universe
+    universe = fetch_nse_universe("NIFTY 500")
+    
+    # Execute Swing Scan
+    swing_results = scan_markets(
+        universe, 
+        mode="SWING", 
+        total_capital=TOTAL_CAPITAL, 
+        risk_per_trade_pct=RISK_PER_TRADE_PCT
+    )
+    
+    print("\n------------------------------------------------------------")
+    print("                 TOP SWING TRADE CANDIDATES                 ")
+    print("------------------------------------------------------------")
+    if not swing_results.empty:
+        print(swing_results.to_string(index=False))
+    else:
+        print("No swing trade candidates met all technical criteria today.")
+        
+    # Execute Single Stock Analysis Example
+    analyze_stock("RELIANCE")
