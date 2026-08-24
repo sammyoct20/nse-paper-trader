@@ -33,6 +33,14 @@ class PaperEngine:
         except:
             return None
 
+    def format_symbol(self, symbol):
+        symbol = symbol.upper().strip()
+
+        if symbol.endswith(".NS") or symbol.endswith(".BO"):
+            return symbol
+
+        return symbol + ".NS"
+
     # ---------------- INDICATORS ----------------
     def apply_indicators(self, df):
         df["EMA20"] = df["Close"].ewm(span=20).mean()
@@ -83,8 +91,8 @@ class PaperEngine:
         orb_high = orb["High"].max()
         orb_low = orb["Low"].min()
 
-        latest = df.iloc[-1]
-        price = float(latest["Close"])
+        last = df.iloc[-1]
+        price = float(last["Close"])
 
         if price > orb_high:
             return "NIFTY", "CALL", price, orb_low, price + (price - orb_low) * 2
@@ -108,6 +116,8 @@ class PaperEngine:
         if cur.fetchone():
             conn.close()
             return
+
+        print(f"Inserted {symbol} | {ttype}")
 
         cur.execute("""
         INSERT INTO trades 
@@ -150,11 +160,14 @@ class PaperEngine:
             if low <= sl:
                 exit_price = sl
                 reason = "SL HIT"
+
             elif high >= target:
                 exit_price = target
                 reason = "TARGET HIT"
 
             if exit_price:
+                print(f"Closed {symbol} | {reason}")
+
                 pnl = exit_price - entry
 
                 cur.execute("""
@@ -169,6 +182,63 @@ class PaperEngine:
 
         conn.commit()
         conn.close()
+
+    # ---------------- ANALYZER ----------------
+    def analyze_stock(self, symbol):
+
+        symbol = self.format_symbol(symbol)
+
+        df = self.get_data(symbol)
+
+        if df is None or df.empty:
+            symbol = symbol.replace(".NS", ".BO")
+            df = self.get_data(symbol)
+
+        if df is None or len(df) < 100:
+            return {"error": "Not enough data"}
+
+        df = self.apply_indicators(df)
+        last = df.iloc[-1]
+
+        price = float(last["Close"])
+        ema20 = float(last["EMA20"])
+        ema50 = float(last["EMA50"])
+        rsi = float(last["RSI"])
+
+        df["vol_avg"] = df["Volume"].rolling(20).mean()
+        vol = float(last["Volume"])
+        vol_avg = float(last["vol_avg"])
+
+        volume_strength = "HIGH" if vol > 1.5 * vol_avg else "LOW"
+
+        resistance = df["High"].rolling(20).max().iloc[-1]
+        support = df["Low"].rolling(20).min().iloc[-1]
+
+        breakout = price > resistance
+        breakout_strength = "STRONG" if breakout and (price - resistance)/price > 0.02 else "WEAK"
+
+        action = "HOLD"
+
+        if price > ema20 > ema50 and rsi > 50 and breakout and volume_strength == "HIGH":
+            action = "STRONG BUY"
+        elif price > ema20 > ema50:
+            action = "BUY"
+        elif price < ema50:
+            action = "EXIT"
+
+        return {
+            "symbol": symbol.replace(".NS","").replace(".BO",""),
+            "price": round(price,2),
+            "RSI": round(rsi,2),
+            "EMA20": round(ema20,2),
+            "EMA50": round(ema50,2),
+            "support": round(support,2),
+            "resistance": round(resistance,2),
+            "volume_strength": volume_strength,
+            "breakout": breakout,
+            "breakout_strength": breakout_strength,
+            "action": action
+        }
 
     # ---------------- RUN ----------------
     def run(self):
