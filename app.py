@@ -3,7 +3,7 @@ import pandas as pd
 from engine import PaperEngine
 
 st.set_page_config(page_title="NSE Stock & Index Options Scanner Engine", layout="wide")
-st.title("⚡ Sammy - Multi-Asset NSE Trading Engine")
+st.title("⚡ Multi-Asset NSE Trading Engine")
 
 if "engine" not in st.session_state:
     st.session_state.engine = PaperEngine()
@@ -69,11 +69,19 @@ with tab4:
             if "Error" in res:
                 st.error(res["Error"])
             else:
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Price", f"₹{res['Price']}")
-                c2.metric("RSI (14)", res['RSI'])
-                c3.metric("Stop Loss", f"₹{res['StopLoss']}")
-                c4.metric("Target", f"₹{res['Target']}")
+                c2.metric("Technical Score", res['Score'])
+                c3.metric("RSI (14)", res['RSI'])
+                c4.metric("Stop Loss", f"₹{res['StopLoss']}")
+                c5.metric("Target", f"₹{res['Target']}")
+
+                st.markdown("### Technical Setup Checklist")
+                for item in res["Checklist"]:
+                    if item.startswith("✓"):
+                        st.success(item)
+                    else:
+                        st.error(item)
 
 with tab5:
     st.subheader("NIFTY & BANKNIFTY Real-Time Index Options Signals")
