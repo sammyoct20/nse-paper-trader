@@ -334,3 +334,34 @@ class PaperEngine:
             "StopLoss": round(curr_price - (2 * float(atr)), 2),
             "Target": round(curr_price + (4 * float(atr)), 2)
         }
+
+    # -------------------------------------------------------------------
+    # WORKER ENTRYPOINT (REQUIRED FOR GITHUB ACTIONS WORKFLOW)
+    # -------------------------------------------------------------------
+    def run(self):
+        """
+        Main runner executed by worker.py in GitHub Actions background job.
+        """
+        log.info("Starting background automated execution...")
+        
+        # 1. Execute Stock Scanner
+        universe = self.fetch_nse_universe("NIFTY 500")
+        stock_results = self.scan_all_strategies(universe, top_n=5)
+        for category, df in stock_results.items():
+            if not df.empty:
+                log.info(f"[{category}] Detected {len(df)} setups: {df['Ticker'].tolist()}")
+            else:
+                log.info(f"[{category}] No active setups.")
+                
+        # 2. Evaluate Options Signals
+        for idx in self.options_indices:
+            try:
+                sig = self.evaluate_index_options(idx)
+                if sig:
+                    log.info(f"[OPTIONS] Signal found for {idx}: {sig['Direction']} Strike: {sig['Strike']}")
+                else:
+                    log.info(f"[OPTIONS] No active setup for {idx}")
+            except Exception as e:
+                log.error(f"[OPTIONS] Failed evaluating {idx}: {e}")
+                
+        log.info("Background execution finished successfully.")
