@@ -107,7 +107,6 @@ class PaperEngine:
         self.db_dsn = os.getenv("DATABASE_URL")
         self.ensure_schema()
 
-    # Database abstraction (Postgres or SQLite fallback)
     def _get_connection(self):
         if self.db_dsn:
             import psycopg2
@@ -142,9 +141,6 @@ class PaperEngine:
         conn.commit()
         conn.close()
 
-    # -------------------------------------------------------------------
-    # STOCK SCANNER LOGIC (SWING, INTRADAY, BTST)
-    # -------------------------------------------------------------------
     def fetch_nse_universe(self, index_name="NIFTY 500"):
         urls = {
             "NIFTY 50": "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
@@ -208,21 +204,21 @@ class PaperEngine:
                     clean_symbol = ticker.replace(".NS", "")
                     vol_mult = round(curr_vol / curr_vol_sma, 2) if curr_vol_sma > 0 else 1.0
 
-                    # 1. SWING FILTER
+                    # SWING FILTER
                     if (curr_ema20 > curr_ema50) and (curr_close > curr_ema200) and (53 <= curr_rsi <= 72) and (vol_mult >= 1.2) and (curr_close >= prev_high20 * 0.99):
                         sl = curr_close - (2.0 * curr_atr)
                         tgt = curr_close + (4.0 * curr_atr)
                         qty = int(risk_amount / (curr_close - sl)) if (curr_close - sl) > 0 else 0
                         swing_list.append({"Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty})
 
-                    # 2. INTRADAY FILTER
+                    # INTRADAY FILTER
                     if (curr_close > curr_ema20) and (curr_rsi >= 56) and (vol_mult >= 1.5):
                         sl = curr_close - (1.2 * curr_atr)
                         tgt = curr_close + (2.5 * curr_atr)
                         qty = int(risk_amount / (curr_close - sl)) if (curr_close - sl) > 0 else 0
                         intraday_list.append({"Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty})
 
-                    # 3. BTST FILTER
+                    # BTST FILTER
                     day_range = curr_high - curr_low
                     close_loc = (curr_close - curr_low) / day_range if day_range > 0 else 0
                     if (close_loc >= 0.80) and (58 <= curr_rsi <= 75) and (vol_mult >= 1.5) and (curr_close > prev_close):
@@ -240,9 +236,6 @@ class PaperEngine:
             "BTST": pd.DataFrame(btst_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if btst_list else pd.DataFrame()
         }
 
-    # -------------------------------------------------------------------
-    # INDEX OPTIONS SCANNER & ENGINE LOGIC
-    # -------------------------------------------------------------------
     def evaluate_index_options(self, index_symbol="NIFTY"):
         yf_symbol = INDEX_YF_TICKERS.get(index_symbol, "^NSEI")
         df = yf.download(yf_symbol, period="5d", interval="5m", progress=False)
@@ -318,33 +311,56 @@ class PaperEngine:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
-        close, high, low, volume = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze(), df['Volume'].squeeze()
-        ema200 = ta.trend.ema_indicator(close, window=200).iloc[-1]
-        rsi = ta.momentum.rsi(close, window=14).iloc[-1]
-        atr = ta.volatility.average_true_range(high, low, close, window=14).iloc[-1]
-        vol_sma = volume.rolling(20).mean().iloc[-1]
-        curr_price = float(close.iloc[-1])
-        
+        close = df['Close'].squeeze()
+        high = df['High'].squeeze()
+        low = df['Low'].squeeze()
+        volume = df['Volume'].squeeze()
+
+        ema20 = ta.trend.ema_indicator(close, window=20)
+        ema50 = ta.trend.ema_indicator(close, window=50)
+        ema200 = ta.trend.ema_indicator(close, window=200)
+        rsi = ta.momentum.rsi(close, window=14)
+        atr = ta.volatility.average_true_range(high, low, close, window=14)
+        vol_sma20 = volume.rolling(20).mean()
+
+        curr_close = float(close.iloc[-1])
+        curr_vol = float(volume.iloc[-1])
+        curr_vol_sma = float(vol_sma20.iloc[-1])
+        curr_rsi = float(rsi.iloc[-1])
+        curr_atr = float(atr.iloc[-1])
+        curr_ema20 = float(ema20.iloc[-1])
+        curr_ema50 = float(ema50.iloc[-1])
+        curr_ema200 = float(ema200.iloc[-1])
+
+        # Diagnostic Checklist Criteria
+        c1 = curr_close > curr_ema200
+        c2 = curr_ema20 > curr_ema50
+        c3 = 50 <= curr_rsi <= 75
+        c4 = curr_vol >= curr_vol_sma if curr_vol_sma > 0 else False
+
+        score = sum([c1, c2, c3, c4])
+
+        checklist = [
+            f"{'✓' if c1 else '✗'} Price above 200-day EMA (Macro Bullish)",
+            f"{'✓' if c2 else '✗'} 20 EMA > 50 EMA (Short-term Uptrend)",
+            f"{'✓' if c3 else '✗'} RSI at {round(curr_rsi, 1)} ({'Strong Momentum' if c3 else 'Weak/Overbought'})",
+            f"{'✓' if c4 else '✗'} Daily volume above 20-day average"
+        ]
+
         return {
             "Symbol": ticker_symbol.replace(".NS", ""),
-            "Price": round(curr_price, 2),
-            "RSI": round(float(rsi), 1),
-            "ATR": round(float(atr), 2),
-            "EMA200": round(float(ema200), 2),
-            "StopLoss": round(curr_price - (2 * float(atr)), 2),
-            "Target": round(curr_price + (4 * float(atr)), 2)
+            "Price": round(curr_close, 2),
+            "Score": f"{score}/4",
+            "RSI": round(curr_rsi, 1),
+            "ATR": round(curr_atr, 2),
+            "EMA200": round(curr_ema200, 2),
+            "StopLoss": round(curr_close - (2 * curr_atr), 2),
+            "Target": round(curr_close + (4 * curr_atr), 2),
+            "Checklist": checklist
         }
 
-    # -------------------------------------------------------------------
-    # WORKER ENTRYPOINT (REQUIRED FOR GITHUB ACTIONS WORKFLOW)
-    # -------------------------------------------------------------------
     def run(self):
-        """
-        Main runner executed by worker.py in GitHub Actions background job.
-        """
         log.info("Starting background automated execution...")
-        
-        # 1. Execute Stock Scanner
         universe = self.fetch_nse_universe("NIFTY 500")
         stock_results = self.scan_all_strategies(universe, top_n=5)
         for category, df in stock_results.items():
@@ -353,7 +369,6 @@ class PaperEngine:
             else:
                 log.info(f"[{category}] No active setups.")
                 
-        # 2. Evaluate Options Signals
         for idx in self.options_indices:
             try:
                 sig = self.evaluate_index_options(idx)
