@@ -1,5 +1,9 @@
 import io
+import os
+import time
+import logging
 import warnings
+from datetime import datetime, date
 import requests
 import pandas as pd
 import numpy as np
@@ -7,20 +11,141 @@ import yfinance as yf
 import ta
 
 warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("unified_engine")
 
+# -------------------------------------------------------------------
+# OPTIONS CLIENT & HELPERS (NSE Option Chain Parser)
+# -------------------------------------------------------------------
+VALID_INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY"}
+INDEX_YF_TICKERS = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK"}
+
+class NSEOptionsClient:
+    BASE = "https://www.nseindia.com"
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/option-chain",
+        })
+        self._warm_up()
+
+    def _warm_up(self):
+        try:
+            self.session.get(self.BASE, timeout=10)
+            self.session.get(f"{self.BASE}/option-chain", timeout=10)
+        except Exception as e:
+            log.warning(f"NSE session warm-up failed: {e}")
+
+    def fetch_chain(self, index_symbol: str) -> dict:
+        if index_symbol not in VALID_INDEX_SYMBOLS:
+            raise ValueError(f"Unsupported index symbol: {index_symbol}")
+        url = f"{self.BASE}/api/option-chain-indices"
+        r = self.session.get(url, params={"symbol": index_symbol}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+def nearest_expiry(chain_json: dict, min_days_out: int = 1) -> str | None:
+    expiries = chain_json.get("records", {}).get("expiryDates", [])
+    if not expiries:
+        return None
+    today = datetime.now().date()
+    for exp_str in expiries:
+        try:
+            exp_date = datetime.strptime(exp_str, "%d-%b-%Y").date()
+        except ValueError:
+            continue
+        if (exp_date - today).days >= min_days_out:
+            return exp_str
+    return expiries[-1] if expiries else None
+
+def atm_strike(chain_json: dict, spot_price: float) -> float | None:
+    strikes = sorted(set(chain_json.get("records", {}).get("strikePrices", [])))
+    if not strikes:
+        return None
+    return min(strikes, key=lambda k: abs(k - spot_price))
+
+def get_contract(chain_json: dict, strike: float, expiry: str, option_type: str) -> dict | None:
+    for row in chain_json.get("records", {}).get("data", []):
+        if row.get("strikePrice") == strike and row.get("expiryDate") == expiry:
+            leg = row.get(option_type)
+            if leg and leg.get("lastPrice") is not None:
+                return {
+                    "ltp": float(leg["lastPrice"]),
+                    "oi": leg.get("openInterest"),
+                    "iv": leg.get("impliedVolatility"),
+                }
+    return None
+
+def spot_price(chain_json: dict) -> float | None:
+    val = chain_json.get("records", {}).get("underlyingValue")
+    return float(val) if val is not None else None
+
+# -------------------------------------------------------------------
+# MAIN CORE ENGINE: PAPER ENGINE (STOCKS & OPTIONS)
+# -------------------------------------------------------------------
 class PaperEngine:
-    """
-    High-performance trading scanner with strict institutional filters:
-    - Intraday: Volume > 1.5x + RSI >= 56 + Price > 20 EMA
-    - BTST: Volume > 1.5x + RSI (58-75) + Candle Close Loc >= 80% + Price > Prev Close
-    - Swing: Volume > 1.2x + RSI (53-72) + 20-Day High Breakout + (20 EMA > 50 EMA & Price > 200 EMA)
-    """
     def __init__(self, initial_balance=100000.0, risk_per_trade_pct=1.0):
-        self.balance = initial_balance
+        self.balance = float(os.getenv("OPTIONS_CAPITAL", initial_balance))
         self.risk_per_trade_pct = risk_per_trade_pct
+        
+        # Options Config
+        self.options_indices = ["NIFTY", "BANKNIFTY"]
+        self.lot_sizes = {
+            "NIFTY": int(os.getenv("NIFTY_LOT_SIZE", 25)),
+            "BANKNIFTY": int(os.getenv("BANKNIFTY_LOT_SIZE", 15))
+        }
+        self.max_option_trades = int(os.getenv("OPTIONS_MAX_TRADES", 2))
+        self.opt_stop_loss_pct = float(os.getenv("OPTIONS_STOP_LOSS_PCT", 0.30))
+        self.opt_target_pct = float(os.getenv("OPTIONS_TARGET_PCT", 0.50))
+        
+        self.nse_opt = NSEOptionsClient()
+        self.db_dsn = os.getenv("DATABASE_URL")
+        self.ensure_schema()
 
+    # Database abstraction (Postgres or SQLite fallback)
+    def _get_connection(self):
+        if self.db_dsn:
+            import psycopg2
+            return psycopg2.connect(self.db_dsn)
+        else:
+            import sqlite3
+            return sqlite3.connect("trading_paper.db")
+
+    def ensure_schema(self):
+        conn = self._get_connection()
+        cur = conn.cursor()
+        if self.db_dsn:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS options_trades (
+                id SERIAL PRIMARY KEY, index_symbol TEXT, option_type TEXT,
+                strike FLOAT, expiry TEXT, lot_size INT, lots INT,
+                entry_premium FLOAT, stop_loss_premium FLOAT, target_premium FLOAT,
+                status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                exit_time TIMESTAMP, exit_premium FLOAT, exit_reason TEXT, pnl FLOAT
+            );
+            """)
+        else:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS options_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, index_symbol TEXT, option_type TEXT,
+                strike REAL, expiry TEXT, lot_size INTEGER, lots INTEGER,
+                entry_premium REAL, stop_loss_premium REAL, target_premium REAL,
+                status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                exit_time TIMESTAMP, exit_premium REAL, exit_reason TEXT, pnl REAL
+            );
+            """)
+        conn.commit()
+        conn.close()
+
+    # -------------------------------------------------------------------
+    # STOCK SCANNER LOGIC (SWING, INTRADAY, BTST)
+    # -------------------------------------------------------------------
     def fetch_nse_universe(self, index_name="NIFTY 500"):
-        """Fetches ticker lists dynamically from NSE archives."""
         urls = {
             "NIFTY 50": "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
             "NIFTY NEXT 50": "https://archives.nseindia.com/content/indices/ind_niftynext50list.csv",
@@ -28,28 +153,15 @@ class PaperEngine:
         }
         url = urls.get(index_name, urls["NIFTY 500"])
         headers = {"User-Agent": "Mozilla/5.0"}
-        
         try:
             res = requests.get(url, headers=headers, timeout=10)
             res.raise_for_status()
             df = pd.read_csv(io.StringIO(res.text))
             return [f"{symbol}.NS" for symbol in df['Symbol'].tolist()]
         except Exception:
-            return [
-                "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
-                "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LT.NS", "AXISBANK.NS"
-            ]
-
-    def _flatten_df(self, df):
-        """Converts yfinance 2D DataFrame into 1D Series safely."""
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
+            return ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "SBIN.NS"]
 
     def scan_all_strategies(self, tickers=None, top_n=5):
-        """
-        Scans stock universe with strict parameter filters and returns top N results per strategy.
-        """
         if tickers is None:
             tickers = self.fetch_nse_universe("NIFTY 500")
             
@@ -59,28 +171,14 @@ class PaperEngine:
         batch_size = 50
         for i in range(0, len(tickers), batch_size):
             chunk = tickers[i:i + batch_size]
-            
             try:
-                data = yf.download(
-                    tickers=chunk, 
-                    period="1y", 
-                    interval="1d", 
-                    group_by='ticker', 
-                    threads=True, 
-                    progress=False
-                )
+                data = yf.download(tickers=chunk, period="1y", interval="1d", group_by='ticker', threads=True, progress=False)
             except Exception:
                 continue
 
             for ticker in chunk:
                 try:
-                    if isinstance(data.columns, pd.MultiIndex):
-                        if ticker not in data.columns.levels[0]:
-                            continue
-                        df = data[ticker].dropna()
-                    else:
-                        df = data.dropna()
-
+                    df = data[ticker].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
                     if len(df) < 50:
                         continue
 
@@ -89,7 +187,6 @@ class PaperEngine:
                     low = df['Low'].squeeze()
                     volume = df['Volume'].squeeze()
 
-                    # Technical Indicators
                     ema20 = ta.trend.ema_indicator(close, window=20)
                     ema50 = ta.trend.ema_indicator(close, window=50)
                     ema200 = ta.trend.ema_indicator(close, window=200)
@@ -98,153 +195,142 @@ class PaperEngine:
                     vol_sma20 = volume.rolling(20).mean()
                     high_20 = high.rolling(20).max()
 
-                    curr_close = float(close.iloc[-1])
-                    prev_close = float(close.iloc[-2])
-                    curr_high = float(high.iloc[-1])
-                    curr_low = float(low.iloc[-1])
-                    curr_vol = float(volume.iloc[-1])
-                    curr_vol_sma = float(vol_sma20.iloc[-1])
-                    curr_rsi = float(rsi.iloc[-1])
-                    curr_atr = float(atr.iloc[-1])
-                    curr_ema20 = float(ema20.iloc[-1])
-                    curr_ema50 = float(ema50.iloc[-1])
-                    curr_ema200 = float(ema200.iloc[-1])
+                    curr_close, prev_close = float(close.iloc[-1]), float(close.iloc[-2])
+                    curr_high, curr_low = float(high.iloc[-1]), float(low.iloc[-1])
+                    curr_vol, curr_vol_sma = float(volume.iloc[-1]), float(vol_sma20.iloc[-1])
+                    curr_rsi, curr_atr = float(rsi.iloc[-1]), float(atr.iloc[-1])
+                    curr_ema20, curr_ema50, curr_ema200 = float(ema20.iloc[-1]), float(ema50.iloc[-1]), float(ema200.iloc[-1])
                     prev_high20 = float(high_20.iloc[-2])
 
-                    # Minimum Turnover Liquidity Filter: ₹50 Lakhs
                     if (curr_close * curr_vol_sma) < 5_000_000:
                         continue
 
                     clean_symbol = ticker.replace(".NS", "")
                     vol_mult = round(curr_vol / curr_vol_sma, 2) if curr_vol_sma > 0 else 1.0
 
-                    # 1. STRICT SWING FILTER
-                    cond_swing_trend = (curr_ema20 > curr_ema50) and (curr_close > curr_ema200)
-                    cond_swing_rsi = 53 <= curr_rsi <= 72
-                    cond_swing_vol = vol_mult >= 1.2
-                    cond_swing_breakout = curr_close >= (prev_high20 * 0.99)
-
-                    if cond_swing_trend and cond_swing_rsi and cond_swing_vol and cond_swing_breakout:
+                    # 1. SWING FILTER
+                    if (curr_ema20 > curr_ema50) and (curr_close > curr_ema200) and (53 <= curr_rsi <= 72) and (vol_mult >= 1.2) and (curr_close >= prev_high20 * 0.99):
                         sl = curr_close - (2.0 * curr_atr)
                         tgt = curr_close + (4.0 * curr_atr)
                         qty = int(risk_amount / (curr_close - sl)) if (curr_close - sl) > 0 else 0
-                        swing_list.append({
-                            "Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1),
-                            "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty
-                        })
+                        swing_list.append({"Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty})
 
-                    # 2. STRICT INTRADAY FILTER
-                    cond_intra_ema = curr_close > curr_ema20
-                    cond_intra_rsi = curr_rsi >= 56
-                    cond_intra_vol = vol_mult >= 1.5
-
-                    if cond_intra_ema and cond_intra_rsi and cond_intra_vol:
+                    # 2. INTRADAY FILTER
+                    if (curr_close > curr_ema20) and (curr_rsi >= 56) and (vol_mult >= 1.5):
                         sl = curr_close - (1.2 * curr_atr)
                         tgt = curr_close + (2.5 * curr_atr)
                         qty = int(risk_amount / (curr_close - sl)) if (curr_close - sl) > 0 else 0
-                        intraday_list.append({
-                            "Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1),
-                            "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty
-                        })
+                        intraday_list.append({"Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty})
 
-                    # 3. STRICT BTST FILTER
+                    # 3. BTST FILTER
                     day_range = curr_high - curr_low
-                    close_location = (curr_close - curr_low) / day_range if day_range > 0 else 0
-                    cond_btst_close = close_location >= 0.80
-                    cond_btst_rsi = 58 <= curr_rsi <= 75
-                    cond_btst_vol = vol_mult >= 1.5
-                    cond_btst_green = curr_close > prev_close
-
-                    if cond_btst_close and cond_btst_rsi and cond_btst_vol and cond_btst_green:
+                    close_loc = (curr_close - curr_low) / day_range if day_range > 0 else 0
+                    if (close_loc >= 0.80) and (58 <= curr_rsi <= 75) and (vol_mult >= 1.5) and (curr_close > prev_close):
                         sl = curr_close - (1.5 * curr_atr)
                         tgt = curr_close + (2.0 * curr_atr)
                         qty = int(risk_amount / (curr_close - sl)) if (curr_close - sl) > 0 else 0
-                        btst_list.append({
-                            "Ticker": clean_symbol, "Price": round(curr_close, 2), "Close_High_%": round(close_location * 100, 1),
-                            "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty
-                        })
+                        btst_list.append({"Ticker": clean_symbol, "Price": round(curr_close, 2), "Close_High_%": round(close_loc * 100, 1), "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty})
 
                 except Exception:
                     continue
 
-        # Sort results by highest Volume Multiplier and pick top N
-        df_swing = pd.DataFrame(swing_list)
-        if not df_swing.empty:
-            df_swing = df_swing.sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True)
+        return {
+            "SWING": pd.DataFrame(swing_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if swing_list else pd.DataFrame(),
+            "INTRADAY": pd.DataFrame(intraday_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if intraday_list else pd.DataFrame(),
+            "BTST": pd.DataFrame(btst_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if btst_list else pd.DataFrame()
+        }
 
-        df_intraday = pd.DataFrame(intraday_list)
-        if not df_intraday.empty:
-            df_intraday = df_intraday.sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True)
+    # -------------------------------------------------------------------
+    # INDEX OPTIONS SCANNER & ENGINE LOGIC
+    # -------------------------------------------------------------------
+    def evaluate_index_options(self, index_symbol="NIFTY"):
+        yf_symbol = INDEX_YF_TICKERS.get(index_symbol, "^NSEI")
+        df = yf.download(yf_symbol, period="5d", interval="5m", progress=False)
+        if df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
-        df_btst = pd.DataFrame(btst_list)
-        if not df_btst.empty:
-            df_btst = df_btst.sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True)
+        df['ema_fast'] = df['Close'].ewm(span=20, min_periods=20).mean()
+        df['ema_slow'] = df['Close'].ewm(span=50, min_periods=50).mean()
+        df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        price, ema_f, ema_s, r = float(latest["Close"]), float(latest["ema_fast"]), float(latest["ema_slow"]), float(latest["rsi"])
+        prev_high, prev_low = float(prev["High"]), float(prev["Low"])
+
+        direction = None
+        if price > ema_f > ema_s and 45 < r < 70 and price > prev_high:
+            direction = "CE"
+        elif price < ema_f < ema_s and 30 < r < 55 and price < prev_low:
+            direction = "PE"
+
+        if not direction:
+            return None
+
+        try:
+            chain = self.nse_opt.fetch_chain(index_symbol)
+        except Exception:
+            return None
+
+        spot = spot_price(chain)
+        expiry = nearest_expiry(chain, min_days_out=1)
+        if not spot or not expiry:
+            return None
+
+        strike = atm_strike(chain, spot)
+        if not strike:
+            return None
+
+        contract = get_contract(chain, strike, expiry, direction)
+        if not contract or not contract.get("ltp"):
+            return None
+
+        entry_premium = contract["ltp"]
+        sl_premium = round(entry_premium * (1 - self.opt_stop_loss_pct), 2)
+        tgt_premium = round(entry_premium * (1 + self.opt_target_pct), 2)
+        lot_size = self.lot_sizes.get(index_symbol, 25)
+
+        risk_amount = self.balance * (self.risk_per_trade_pct / 100.0)
+        risk_per_lot = (entry_premium - sl_premium) * lot_size
+        lots = int(risk_amount / risk_per_lot) if risk_per_lot > 0 else 1
 
         return {
-            "SWING": df_swing,
-            "INTRADAY": df_intraday,
-            "BTST": df_btst
+            "Index": index_symbol,
+            "Direction": direction,
+            "Spot Price": round(spot, 2),
+            "Strike": strike,
+            "Expiry": expiry,
+            "Premium (LTP)": round(entry_premium, 2),
+            "Stop Loss": sl_premium,
+            "Target": tgt_premium,
+            "Lot Size": lot_size,
+            "Recommended Lots": max(1, lots)
         }
 
     def analyze_stock(self, symbol):
-        """Generates single stock diagnostic."""
         ticker_symbol = f"{symbol.upper()}.NS" if not symbol.endswith(".NS") else symbol.upper()
         df = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
-        
         if df.empty:
             return {"Error": f"No data found for symbol: {symbol}"}
             
-        df = self._flatten_df(df)
-        
-        close = df['Close'].squeeze()
-        high = df['High'].squeeze()
-        low = df['Low'].squeeze()
-        volume = df['Volume'].squeeze()
-        
-        ema20 = ta.trend.ema_indicator(close, window=20).iloc[-1]
-        ema50 = ta.trend.ema_indicator(close, window=50).iloc[-1]
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        close, high, low, volume = df['Close'].squeeze(), df['High'].squeeze(), df['Low'].squeeze(), df['Volume'].squeeze()
         ema200 = ta.trend.ema_indicator(close, window=200).iloc[-1]
         rsi = ta.momentum.rsi(close, window=14).iloc[-1]
         atr = ta.volatility.average_true_range(high, low, close, window=14).iloc[-1]
         vol_sma = volume.rolling(20).mean().iloc[-1]
         curr_price = float(close.iloc[-1])
-        curr_vol = float(volume.iloc[-1])
         
-        score = 0
-        reasons = []
-        
-        if curr_price > ema200:
-            score += 25
-            reasons.append("✓ Price above 200-day EMA (Macro Bullish)")
-        else:
-            reasons.append("✗ Price below 200-day EMA (Macro Bearish)")
-            
-        if ema20 > ema50:
-            score += 25
-            reasons.append("✓ 20 EMA > 50 EMA (Short-term Uptrend)")
-        else:
-            reasons.append("✗ 20 EMA < 50 EMA (Short-term Downtrend)")
-            
-        if 50 <= rsi <= 72:
-            score += 25
-            reasons.append(f"✓ RSI at {round(float(rsi), 1)} (Strong Momentum)")
-        else:
-            reasons.append(f"✗ RSI at {round(float(rsi), 1)} (Weak/Extreme Momentum)")
-            
-        if curr_vol > vol_sma:
-            score += 25
-            reasons.append("✓ Daily volume above 20-day average")
-        else:
-            reasons.append("✗ Daily volume below 20-day average")
-            
         return {
             "Symbol": ticker_symbol.replace(".NS", ""),
-            "Score": score,
             "Price": round(curr_price, 2),
             "RSI": round(float(rsi), 1),
             "ATR": round(float(atr), 2),
             "EMA200": round(float(ema200), 2),
             "StopLoss": round(curr_price - (2 * float(atr)), 2),
-            "Target": round(curr_price + (4 * float(atr)), 2),
-            "Reasons": reasons
+            "Target": round(curr_price + (4 * float(atr)), 2)
         }
