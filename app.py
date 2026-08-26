@@ -3,7 +3,7 @@ import pandas as pd
 from engine import PaperEngine
 
 st.set_page_config(page_title="NSE Stock & Index Options Scanner Engine", layout="wide")
-st.title("⚡ Multi-Asset NSE Trading Engine")
+st.title("⚡ Multi-Asset Trading Engine")
 
 if "engine" not in st.session_state:
     st.session_state.engine = PaperEngine()
@@ -84,19 +84,19 @@ with tab4:
                         st.error(item)
 
 with tab5:
-    st.subheader("NIFTY & BANKNIFTY Real-Time Index Options Signals")
+    st.subheader("NIFTY (Tuesday Expiry) & SENSEX (Thursday Expiry) Signals")
     col1, col2 = st.columns(2)
     with col1:
         st.caption("Strategy: 5-Min Trend + RSI Momentum Breakout (CE/PE)")
     with col2:
-        st.caption("Data Source: Direct Live NSE Option Chain")
+        st.caption("Lot Sizes: NIFTY = 65 | SENSEX = 20")
 
-    idx_select = st.selectbox("Select Index:", ["NIFTY", "BANKNIFTY"])
+    idx_select = st.selectbox("Select Index:", ["NIFTY", "SENSEX"])
     if st.button(f"⚡ Scan Live {idx_select} Options Signal"):
-        with st.spinner(f"Evaluating 5m charts and NSE Live Option Chain for {idx_select}..."):
+        with st.spinner(f"Evaluating 5m charts for {idx_select}..."):
             signal = st.session_state.engine.evaluate_index_options(idx_select)
             if signal:
-                st.success(f"Directional Signal Triggered: {signal['Direction']}!")
+                st.success(f"Trade Execution Contract: {signal['Contract Symbol']}")
                 st.json(signal)
             else:
                 st.warning(f"No clear CE/PE directional breakout detected for {idx_select} right now.")
