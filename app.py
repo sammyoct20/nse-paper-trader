@@ -3,7 +3,7 @@ import pandas as pd
 from engine import PaperEngine
 
 st.set_page_config(page_title="NSE Filtered Scanner Engine", layout="wide")
-st.title("⚡ Multi-Strategy NSE Trading Engine")
+st.title("⚡ Sammy - NSE Trading Engine")
 
 if "engine" not in st.session_state:
     st.session_state.engine = PaperEngine()
