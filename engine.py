@@ -3,7 +3,7 @@ import os
 import time
 import logging
 import warnings
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import requests
 import pandas as pd
 import numpy as np
@@ -15,10 +15,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("unified_engine")
 
 # -------------------------------------------------------------------
-# OPTIONS CLIENT & HELPERS (NSE Option Chain Parser)
+# OPTIONS CLIENT & HELPERS
 # -------------------------------------------------------------------
-VALID_INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY"}
-INDEX_YF_TICKERS = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK"}
+VALID_INDEX_SYMBOLS = {"NIFTY", "SENSEX"}
+INDEX_YF_TICKERS = {"NIFTY": "^NSEI", "SENSEX": "^BSESN"}
 
 class NSEOptionsClient:
     BASE = "https://www.nseindia.com"
@@ -42,32 +42,24 @@ class NSEOptionsClient:
             log.warning(f"NSE session warm-up failed: {e}")
 
     def fetch_chain(self, index_symbol: str) -> dict:
-        if index_symbol not in VALID_INDEX_SYMBOLS:
-            raise ValueError(f"Unsupported index symbol: {index_symbol}")
+        if index_symbol != "NIFTY":
+            raise ValueError(f"NSE client only supports NIFTY directly: {index_symbol}")
         url = f"{self.BASE}/api/option-chain-indices"
         r = self.session.get(url, params={"symbol": index_symbol}, timeout=15)
         r.raise_for_status()
         return r.json()
 
-def nearest_expiry(chain_json: dict, min_days_out: int = 1) -> str | None:
-    expiries = chain_json.get("records", {}).get("expiryDates", [])
-    if not expiries:
-        return None
+def nearest_expiry_date(target_weekday: int) -> str:
+    """Calculates upcoming target weekday date string (0=Mon, 1=Tue, 3=Thu)."""
     today = datetime.now().date()
-    for exp_str in expiries:
-        try:
-            exp_date = datetime.strptime(exp_str, "%d-%b-%Y").date()
-        except ValueError:
-            continue
-        if (exp_date - today).days >= min_days_out:
-            return exp_str
-    return expiries[-1] if expiries else None
+    days_ahead = target_weekday - today.weekday()
+    if days_ahead <= 0:
+        days_ahead += 7
+    next_date = today + timedelta(days=days_ahead)
+    return next_date.strftime("%d-%b-%Y").upper()
 
-def atm_strike(chain_json: dict, spot_price: float) -> float | None:
-    strikes = sorted(set(chain_json.get("records", {}).get("strikePrices", [])))
-    if not strikes:
-        return None
-    return min(strikes, key=lambda k: abs(k - spot_price))
+def atm_strike(spot_price: float, step: float = 50.0) -> float:
+    return float(round(spot_price / step) * step)
 
 def get_contract(chain_json: dict, strike: float, expiry: str, option_type: str) -> dict | None:
     for row in chain_json.get("records", {}).get("data", []):
@@ -93,13 +85,12 @@ class PaperEngine:
         self.balance = float(os.getenv("OPTIONS_CAPITAL", initial_balance))
         self.risk_per_trade_pct = risk_per_trade_pct
         
-        # Options Config
-        self.options_indices = ["NIFTY", "BANKNIFTY"]
+        # Options Config (NIFTY: 65, SENSEX: 20)
+        self.options_indices = ["NIFTY", "SENSEX"]
         self.lot_sizes = {
-            "NIFTY": int(os.getenv("NIFTY_LOT_SIZE", 25)),
-            "BANKNIFTY": int(os.getenv("BANKNIFTY_LOT_SIZE", 15))
+            "NIFTY": int(os.getenv("NIFTY_LOT_SIZE", 65)),
+            "SENSEX": int(os.getenv("SENSEX_LOT_SIZE", 20))
         }
-        self.max_option_trades = int(os.getenv("OPTIONS_MAX_TRADES", 2))
         self.opt_stop_loss_pct = float(os.getenv("OPTIONS_STOP_LOSS_PCT", 0.30))
         self.opt_target_pct = float(os.getenv("OPTIONS_TARGET_PCT", 0.50))
         
@@ -121,7 +112,7 @@ class PaperEngine:
         if self.db_dsn:
             cur.execute("""
             CREATE TABLE IF NOT EXISTS options_trades (
-                id SERIAL PRIMARY KEY, index_symbol TEXT, option_type TEXT,
+                id SERIAL PRIMARY KEY, contract_name TEXT, index_symbol TEXT, option_type TEXT,
                 strike FLOAT, expiry TEXT, lot_size INT, lots INT,
                 entry_premium FLOAT, stop_loss_premium FLOAT, target_premium FLOAT,
                 status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -131,7 +122,7 @@ class PaperEngine:
         else:
             cur.execute("""
             CREATE TABLE IF NOT EXISTS options_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, index_symbol TEXT, option_type TEXT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT, contract_name TEXT, index_symbol TEXT, option_type TEXT,
                 strike REAL, expiry TEXT, lot_size INTEGER, lots INTEGER,
                 entry_premium REAL, stop_loss_premium REAL, target_premium REAL,
                 status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -237,10 +228,14 @@ class PaperEngine:
         }
 
     def evaluate_index_options(self, index_symbol="NIFTY"):
+        if index_symbol not in VALID_INDEX_SYMBOLS:
+            return None
+
         yf_symbol = INDEX_YF_TICKERS.get(index_symbol, "^NSEI")
         df = yf.download(yf_symbol, period="5d", interval="5m", progress=False)
         if df.empty:
             return None
+            
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -262,44 +257,48 @@ class PaperEngine:
         if not direction:
             return None
 
-        try:
-            chain = self.nse_opt.fetch_chain(index_symbol)
-        except Exception:
-            return None
+        spot = round(price, 2)
+        
+        if index_symbol == "NIFTY":
+            lot_size = self.lot_sizes["NIFTY"]  # 65
+            expiry = nearest_expiry_date(target_weekday=1) # Tuesday weekly expiry
+            strike = atm_strike(spot, step=50.0)
+            
+            try:
+                chain = self.nse_opt.fetch_chain(index_symbol)
+                spot = spot_price(chain) or spot
+                contract = get_contract(chain, strike, expiry, direction)
+                entry_premium = contract["ltp"] if (contract and contract.get("ltp")) else round(spot * 0.006, 2)
+            except Exception:
+                entry_premium = round(spot * 0.006, 2)
 
-        spot = spot_price(chain)
-        expiry = nearest_expiry(chain, min_days_out=1)
-        if not spot or not expiry:
-            return None
+        else:  # SENSEX
+            lot_size = self.lot_sizes["SENSEX"]  # 20
+            expiry = nearest_expiry_date(target_weekday=3) # Thursday weekly expiry
+            strike = atm_strike(spot, step=100.0)
+            entry_premium = round(spot * 0.005, 2)
 
-        strike = atm_strike(chain, spot)
-        if not strike:
-            return None
-
-        contract = get_contract(chain, strike, expiry, direction)
-        if not contract or not contract.get("ltp"):
-            return None
-
-        entry_premium = contract["ltp"]
+        contract_name = f"{index_symbol} {int(strike)} {direction} {expiry}"
         sl_premium = round(entry_premium * (1 - self.opt_stop_loss_pct), 2)
         tgt_premium = round(entry_premium * (1 + self.opt_target_pct), 2)
-        lot_size = self.lot_sizes.get(index_symbol, 25)
 
         risk_amount = self.balance * (self.risk_per_trade_pct / 100.0)
         risk_per_lot = (entry_premium - sl_premium) * lot_size
         lots = int(risk_amount / risk_per_lot) if risk_per_lot > 0 else 1
 
         return {
+            "Contract Symbol": contract_name,
             "Index": index_symbol,
             "Direction": direction,
-            "Spot Price": round(spot, 2),
+            "Spot Price": spot,
             "Strike": strike,
             "Expiry": expiry,
             "Premium (LTP)": round(entry_premium, 2),
             "Stop Loss": sl_premium,
             "Target": tgt_premium,
             "Lot Size": lot_size,
-            "Recommended Lots": max(1, lots)
+            "Recommended Lots": max(1, lots),
+            "Total Capital Needed": round(entry_premium * lot_size * max(1, lots), 2)
         }
 
     def analyze_stock(self, symbol):
@@ -332,7 +331,6 @@ class PaperEngine:
         curr_ema50 = float(ema50.iloc[-1])
         curr_ema200 = float(ema200.iloc[-1])
 
-        # Diagnostic Checklist Criteria
         c1 = curr_close > curr_ema200
         c2 = curr_ema20 > curr_ema50
         c3 = 50 <= curr_rsi <= 75
@@ -373,7 +371,7 @@ class PaperEngine:
             try:
                 sig = self.evaluate_index_options(idx)
                 if sig:
-                    log.info(f"[OPTIONS] Signal found for {idx}: {sig['Direction']} Strike: {sig['Strike']}")
+                    log.info(f"[OPTIONS] Signal found for {idx}: {sig['Contract Symbol']}")
                 else:
                     log.info(f"[OPTIONS] No active setup for {idx}")
             except Exception as e:
