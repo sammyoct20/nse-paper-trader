@@ -2,50 +2,63 @@ import streamlit as st
 import pandas as pd
 from engine import PaperEngine
 
-st.set_page_config(page_title="NSE Strategy Scanner Engine", layout="wide")
-st.title("⚡Sammy - Multi-Strategy NSE Trading Engine")
+st.set_page_config(page_title="NSE Filtered Scanner Engine", layout="wide")
+st.title("⚡ Multi-Strategy NSE Trading Engine")
 
 if "engine" not in st.session_state:
     st.session_state.engine = PaperEngine()
 
 @st.cache_data(ttl=900)
-def fetch_scan_results(index_name):
+def fetch_scan_results(index_name, top_n):
     engine = st.session_state.engine
     universe = engine.fetch_nse_universe(index_name)
-    results = engine.scan_all_strategies(universe)
+    results = engine.scan_all_strategies(universe, top_n=top_n)
     return results
 
-st.sidebar.header("Scan Controls")
+st.sidebar.header("Scan Parameters")
 selected_index = st.sidebar.selectbox("Universe", ["NIFTY 50", "NIFTY NEXT 50", "NIFTY 500"], index=0)
+max_results = st.sidebar.slider("Max Stock Output Per Strategy", min_value=3, max_value=15, value=5)
 
-if st.sidebar.button("🚀 Run Market Scan"):
-    with st.spinner(f"Scanning {selected_index}..."):
-        scan_data = fetch_scan_results(selected_index)
+if st.sidebar.button("🚀 Run Filtered Market Scan"):
+    with st.spinner(f"Scanning {selected_index} for top {max_results} setups..."):
+        scan_data = fetch_scan_results(selected_index, max_results)
         st.session_state["scan_results"] = scan_data
     st.sidebar.success("Scan Complete!")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Swing Trade", "⚡ Intraday", "🌙 BTST Setups", "🔍 Stock Analyzer"])
 
 with tab1:
-    st.subheader("Swing Trading Candidates")
+    st.subheader(f"Top {max_results} Swing Trading Candidates")
     if "scan_results" in st.session_state:
-        st.dataframe(st.session_state["scan_results"]["SWING"], use_container_width=True)
+        df = st.session_state["scan_results"]["SWING"]
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No stocks matched strict Swing criteria.")
     else:
-        st.info("Click 'Run Market Scan' to fetch setups.")
+        st.info("Click 'Run Filtered Market Scan' to fetch setups.")
 
 with tab2:
-    st.subheader("Intraday Momentum Setups")
+    st.subheader(f"Top {max_results} Intraday Momentum Setups")
     if "scan_results" in st.session_state:
-        st.dataframe(st.session_state["scan_results"]["INTRADAY"], use_container_width=True)
+        df = st.session_state["scan_results"]["INTRADAY"]
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No stocks matched strict Intraday criteria.")
     else:
-        st.info("Click 'Run Market Scan' to fetch setups.")
+        st.info("Click 'Run Filtered Market Scan' to fetch setups.")
 
 with tab3:
-    st.subheader("BTST Candidates")
+    st.subheader(f"Top {max_results} BTST Candidates")
     if "scan_results" in st.session_state:
-        st.dataframe(st.session_state["scan_results"]["BTST"], use_container_width=True)
+        df = st.session_state["scan_results"]["BTST"]
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No stocks matched strict BTST criteria.")
     else:
-        st.info("Click 'Run Market Scan' to fetch setups.")
+        st.info("Click 'Run Filtered Market Scan' to fetch setups.")
 
 with tab4:
     st.subheader("Single Stock Technical Diagnostic")
