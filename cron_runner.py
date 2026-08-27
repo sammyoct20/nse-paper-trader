@@ -32,13 +32,16 @@ class Trade(Base):
     entry_date = Column(DateTime, default=datetime.datetime.utcnow)
     exit_date = Column(DateTime, nullable=True)
 
-# AUTO-PATCH SCHEMA: Safely adds missing columns if table already exists
-try:
-    with db_engine.connect() as conn:
-        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy VARCHAR(50);"))
+# AUTO-MIGRATION: Drops legacy/incompatible table and recreates clean schema automatically
+with db_engine.connect() as conn:
+    try:
+        # Check if the existing table has the correct entry_price column
+        conn.execute(text("SELECT entry_price FROM trades LIMIT 1;"))
+    except Exception:
+        # Legacy schema detected - drop old table to rebuild with current columns
+        print("Legacy schema detected. Dropping old table to rebuild clean structure...")
+        conn.execute(text("DROP TABLE IF EXISTS trades CASCADE;"))
         conn.commit()
-except Exception as e:
-    print(f"Migration check note: {e}")
 
 Base.metadata.create_all(db_engine)
 Session = sessionmaker(bind=db_engine)
