@@ -5,13 +5,12 @@ import datetime
 import requests
 import pandas as pd
 import yfinance as yf
-import ta
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 warnings.filterwarnings("ignore")
 
-# 1. DATABASE SETUP (Render PostgreSQL or local SQLite fallback)
+# 1. DATABASE CONFIGURATION
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///paper_trading.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -23,7 +22,7 @@ class Trade(Base):
     __tablename__ = "trades"
     id = Column(Integer, primary_key=True)
     symbol = Column(String(20))
-    strategy = Column(String(20))
+    strategy = Column(String(50))
     entry_price = Column(Float)
     current_price = Column(Float)
     stop_loss = Column(Float)
@@ -32,6 +31,14 @@ class Trade(Base):
     status = Column(String(20))  # OPEN, TARGET_HIT, SL_HIT
     entry_date = Column(DateTime, default=datetime.datetime.utcnow)
     exit_date = Column(DateTime, nullable=True)
+
+# AUTO-PATCH SCHEMA: Safely adds missing columns if table already exists
+try:
+    with db_engine.connect() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy VARCHAR(50);"))
+        conn.commit()
+except Exception as e:
+    print(f"Migration check note: {e}")
 
 Base.metadata.create_all(db_engine)
 Session = sessionmaker(bind=db_engine)
@@ -49,16 +56,17 @@ def send_telegram_alert(message):
         except Exception as e:
             print(f"Failed to send Telegram alert: {e}")
 
-# 3. POSITION MANAGER (Check Open Positions for Exit)
+# 3. MONITOR AND UPDATE ACTIVE POSITIONS
 def update_open_positions():
     session = Session()
     open_trades = session.query(Trade).filter(Trade.status == "OPEN").all()
     
     if not open_trades:
+        print("No open positions to monitor.")
         session.close()
         return
 
-    print(f"Checking {len(open_trades)} active positions...")
+    print(f"Monitoring {len(open_trades)} active positions...")
     
     for trade in open_trades:
         ticker = f"{trade.symbol}.NS"
@@ -76,7 +84,11 @@ def update_open_positions():
             trade.exit_date = datetime.datetime.utcnow()
             trade.current_price = trade.stop_loss
             pnl = round((trade.stop_loss - trade.entry_price) * trade.quantity, 2)
-            send_telegram_alert(f"🔴 *STOP LOSS HIT*\n\nStock: `{trade.symbol}`\nExit: ₹{trade.stop_loss}\nP&L: ₹{pnl}")
+            send_telegram_alert(
+                f"🔴 *STOP LOSS HIT*\n\n"
+                f"Stock: `{trade.symbol}`\nStrategy: {trade.strategy}\n"
+                f"Exit: ₹{trade.stop_loss}\nP&L: ₹{pnl}"
+            )
             
         # Check Target
         elif latest_high >= trade.target:
@@ -84,19 +96,24 @@ def update_open_positions():
             trade.exit_date = datetime.datetime.utcnow()
             trade.current_price = trade.target
             pnl = round((trade.target - trade.entry_price) * trade.quantity, 2)
-            send_telegram_alert(f"🟢 *TARGET HIT*\n\nStock: `{trade.symbol}`\nExit: ₹{trade.target}\nP&L: ₹{pnl}")
+            send_telegram_alert(
+                f"🟢 *TARGET HIT*\n\n"
+                f"Stock: `{trade.symbol}`\nStrategy: {trade.strategy}\n"
+                f"Exit: ₹{trade.target}\nP&L: ₹{pnl}"
+            )
         else:
             trade.current_price = latest_close
 
     session.commit()
     session.close()
 
-# 4. AUTOMATED SCANNER AND ENTRY EXECUTION
+# 4. RUN SCANNER & EXECUTE NEW TRADES
 def run_automated_scan():
     from engine import PaperEngine
     
+    print("Running market scan across NIFTY 50...")
     engine = PaperEngine()
-    universe = engine.fetch_nse_universe("NIFTY 50")  # Start with Nifty 50 for fast execution
+    universe = engine.fetch_nse_universe("NIFTY 50")
     results = engine.scan_all_strategies(universe)
     
     session = Session()
@@ -106,8 +123,6 @@ def run_automated_scan():
     if not btst_df.empty:
         for _, row in btst_df.head(2).iterrows():  # Max 2 top setups
             symbol = row["Ticker"]
-            
-            # Avoid duplicate active trades for the same stock
             existing = session.query(Trade).filter(Trade.symbol == symbol, Trade.status == "OPEN").first()
             if not existing and row["Qty"] > 0:
                 new_trade = Trade(
