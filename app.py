@@ -14,14 +14,34 @@ def fetch_scan_results(index_name, top_n):
     universe = engine.fetch_nse_universe(index_name)
     return engine.scan_all_strategies(universe, top_n=top_n)
 
+st.sidebar.header("🛡️ Risk Management (Kotegawa Rules)")
+risk_status = st.session_state.engine.risk_status()
+rc1, rc2 = st.sidebar.columns(2)
+rc1.metric("Risk / Trade", f"{risk_status['risk_per_trade_pct']}%", f"₹{risk_status['risk_per_trade_amount']:,.0f}")
+rc2.metric("Max Position", f"{risk_status['max_position_pct']}%", f"₹{risk_status['max_position_value']:,.0f}")
+rc3, rc4 = st.sidebar.columns(2)
+rc3.metric("Open Positions", f"{risk_status['open_positions']}/{risk_status['max_open_positions']}")
+rc4.metric("Today's PnL", f"₹{risk_status['daily_realized_pnl']:,.0f}", f"limit ₹{-risk_status['daily_loss_limit']:,.0f}")
+
+if risk_status["circuit_breaker_tripped"]:
+    st.sidebar.error("🚫 Daily loss circuit breaker TRIPPED — new entries blocked until tomorrow.")
+elif risk_status["open_positions"] >= risk_status["max_open_positions"]:
+    st.sidebar.warning("⚠️ Max open positions reached — new entries blocked.")
+else:
+    st.sidebar.success("✅ Risk gate open — new entries allowed.")
+
+st.sidebar.divider()
 st.sidebar.header("Scan Parameters")
 selected_index = st.sidebar.selectbox("Universe", ["NIFTY 50", "NIFTY NEXT 50", "NIFTY 500"], index=0)
 max_results = st.sidebar.slider("Max Output Per Strategy", min_value=3, max_value=15, value=5)
 
-if st.sidebar.button("🚀 Run Equity Market Scan"):
+scan_disabled = risk_status["circuit_breaker_tripped"]
+if st.sidebar.button("🚀 Run Equity Market Scan", disabled=scan_disabled):
     with st.spinner(f"Scanning {selected_index} for top {max_results} setups..."):
         st.session_state["scan_results"] = fetch_scan_results(selected_index, max_results)
     st.sidebar.success("Scan Complete!")
+if scan_disabled:
+    st.sidebar.caption("Scanning is disabled while the circuit breaker is tripped. Setups can still exceed capital risk limits; wait for tomorrow's reset.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Swing Trade", "⚡ Intraday", "🌙 BTST Setups", "🔍 Stock Analyzer", "📈 Index Options (CE/PE)"
@@ -76,6 +96,13 @@ with tab4:
                 c4.metric("Stop Loss", f"₹{res['StopLoss']}")
                 c5.metric("Target", f"₹{res['Target']}")
 
+                c6, c7, c8 = st.columns(3)
+                c6.metric("Kotegawa-Sized Qty", res['Qty'])
+                c7.metric("Risk Amount", f"₹{res['RiskAmount']}")
+                c8.metric("Position Value", f"₹{res['PositionValue']}")
+                if res['Qty'] == 0:
+                    st.caption("Qty is 0 because the risk gate is currently closed (circuit breaker tripped or max open positions reached) — see the sidebar.")
+
                 st.markdown("### Technical Setup Checklist")
                 for item in res["Checklist"]:
                     if item.startswith("✓"):
@@ -96,7 +123,10 @@ with tab5:
         with st.spinner(f"Evaluating 5m charts for {idx_select}..."):
             signal = st.session_state.engine.evaluate_index_options(idx_select)
             if signal:
-                st.success(f"Trade Execution Contract: {signal['Contract Symbol']}")
+                if signal.get("Blocked Reason"):
+                    st.warning(f"Setup found but blocked: {signal['Blocked Reason']}")
+                else:
+                    st.success(f"Trade Execution Contract: {signal['Contract Symbol']}")
                 st.json(signal)
             else:
                 st.warning(f"No clear CE/PE directional breakout detected for {idx_select} right now.")

@@ -10,6 +10,8 @@ import numpy as np
 import yfinance as yf
 import ta
 
+from risk_manager import RiskManager
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("unified_engine")
@@ -84,16 +86,29 @@ class PaperEngine:
     def __init__(self, initial_balance=100000.0, risk_per_trade_pct=1.0):
         self.balance = float(os.getenv("OPTIONS_CAPITAL", initial_balance))
         self.risk_per_trade_pct = risk_per_trade_pct
-        
+
+        # ---- Kotegawa-style risk management ----------------------------
+        # Risk a small fixed % of capital per trade, cap any single
+        # position's capital allocation, cap simultaneous open positions,
+        # and halt new entries once a daily loss limit is hit. See
+        # risk_manager.py for the rationale behind each parameter.
+        self.risk = RiskManager(
+            capital=self.balance,
+            risk_per_trade_pct=self.risk_per_trade_pct,
+        )
+
         # Options Config (NIFTY: 65, SENSEX: 20)
         self.options_indices = ["NIFTY", "SENSEX"]
         self.lot_sizes = {
             "NIFTY": int(os.getenv("NIFTY_LOT_SIZE", 65)),
             "SENSEX": int(os.getenv("SENSEX_LOT_SIZE", 20))
         }
-        self.opt_stop_loss_pct = float(os.getenv("OPTIONS_STOP_LOSS_PCT", 0.30))
-        self.opt_target_pct = float(os.getenv("OPTIONS_TARGET_PCT", 0.50))
-        
+        # Tighter than before by design: options premiums move fast, and
+        # Kotegawa's edge came from cutting losses quickly rather than
+        # hoping a losing trade recovers.
+        self.opt_stop_loss_pct = float(os.getenv("OPTIONS_STOP_LOSS_PCT", 0.25))
+        self.opt_target_pct = float(os.getenv("OPTIONS_TARGET_PCT", 0.40))
+
         self.nse_opt = NSEOptionsClient()
         self.db_dsn = os.getenv("DATABASE_URL")
         self.ensure_schema()
@@ -115,6 +130,7 @@ class PaperEngine:
                 id SERIAL PRIMARY KEY, contract_name TEXT, index_symbol TEXT, option_type TEXT,
                 strike FLOAT, expiry TEXT, lot_size INT, lots INT,
                 entry_premium FLOAT, stop_loss_premium FLOAT, target_premium FLOAT,
+                risk_amount FLOAT, position_value FLOAT,
                 status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 exit_time TIMESTAMP, exit_premium FLOAT, exit_reason TEXT, pnl FLOAT
             );
@@ -125,12 +141,83 @@ class PaperEngine:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, contract_name TEXT, index_symbol TEXT, option_type TEXT,
                 strike REAL, expiry TEXT, lot_size INTEGER, lots INTEGER,
                 entry_premium REAL, stop_loss_premium REAL, target_premium REAL,
+                risk_amount REAL, position_value REAL,
                 status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 exit_time TIMESTAMP, exit_premium REAL, exit_reason TEXT, pnl REAL
             );
             """)
         conn.commit()
+
+        # Best-effort migration for tables created before risk_amount /
+        # position_value existed — harmless if the columns are already there.
+        for col in ("risk_amount", "position_value"):
+            coltype = "FLOAT" if self.db_dsn else "REAL"
+            try:
+                cur.execute(f"ALTER TABLE options_trades ADD COLUMN {col} {coltype}")
+                conn.commit()
+            except Exception:
+                if self.db_dsn:
+                    conn.rollback()
+
         conn.close()
+
+    # -----------------------------------------------------------------
+    # RISK STATUS / CIRCUIT BREAKER HELPERS
+    # -----------------------------------------------------------------
+    def get_open_positions_count(self) -> int:
+        try:
+            conn = self._get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM options_trades WHERE status = 'OPEN'")
+            n = cur.fetchone()[0]
+            conn.close()
+            return int(n or 0)
+        except Exception as e:
+            log.warning(f"Could not read open positions count: {e}")
+            return 0
+
+    def get_daily_realized_pnl(self) -> float:
+        try:
+            conn = self._get_connection()
+            cur = conn.cursor()
+            if self.db_dsn:
+                cur.execute(
+                    "SELECT COALESCE(SUM(pnl), 0) FROM options_trades "
+                    "WHERE status = 'CLOSED' AND exit_time::date = CURRENT_DATE"
+                )
+            else:
+                cur.execute(
+                    "SELECT COALESCE(SUM(pnl), 0) FROM options_trades "
+                    "WHERE status = 'CLOSED' AND DATE(exit_time) = DATE('now')"
+                )
+            pnl = cur.fetchone()[0]
+            conn.close()
+            return float(pnl or 0.0)
+        except Exception as e:
+            log.warning(f"Could not read daily realized PnL: {e}")
+            return 0.0
+
+    def risk_status(self) -> dict:
+        """Snapshot of the account-level risk state, used by the dashboard
+        and by scan/signal methods to decide whether new entries are allowed."""
+        daily_pnl = self.get_daily_realized_pnl()
+        open_positions = self.get_open_positions_count()
+        breaker = self.risk.circuit_breaker_tripped(daily_pnl)
+        positions_ok = self.risk.open_positions_allowed(open_positions)
+        return {
+            "capital": round(self.balance, 2),
+            "risk_per_trade_pct": self.risk.risk_per_trade_pct,
+            "risk_per_trade_amount": round(self.risk.risk_amount(), 2),
+            "max_position_pct": self.risk.max_position_pct,
+            "max_position_value": round(self.risk.max_position_value(), 2),
+            "max_daily_loss_pct": self.risk.max_daily_loss_pct,
+            "daily_loss_limit": round(self.risk.daily_loss_limit(), 2),
+            "daily_realized_pnl": round(daily_pnl, 2),
+            "open_positions": open_positions,
+            "max_open_positions": self.risk.max_open_positions,
+            "circuit_breaker_tripped": breaker,
+            "new_entries_allowed": (not breaker) and positions_ok,
+        }
 
     def fetch_nse_universe(self, index_name="NIFTY 500"):
         urls = {
@@ -151,8 +238,13 @@ class PaperEngine:
     def scan_all_strategies(self, tickers=None, top_n=5):
         if tickers is None:
             tickers = self.fetch_nse_universe("NIFTY 500")
-            
-        risk_amount = self.balance * (self.risk_per_trade_pct / 100.0)
+
+        status = self.risk_status()
+        if not status["new_entries_allowed"]:
+            reason = ("daily loss circuit breaker tripped" if status["circuit_breaker_tripped"]
+                       else "max open positions reached")
+            log.warning(f"Risk gate closed ({reason}) — scan will run but sized quantities will be 0.")
+
         swing_list, intraday_list, btst_list = [], [], []
 
         batch_size = 50
@@ -195,28 +287,48 @@ class PaperEngine:
                     clean_symbol = ticker.replace(".NS", "")
                     vol_mult = round(curr_vol / curr_vol_sma, 2) if curr_vol_sma > 0 else 1.0
 
-                    # SWING FILTER
+                    # SWING FILTER — stop tightened to 1.5x ATR (Kotegawa: cut
+                    # losses fast) with target held at >=1.5:1 reward:risk.
                     if (curr_ema20 > curr_ema50) and (curr_close > curr_ema200) and (53 <= curr_rsi <= 72) and (vol_mult >= 1.2) and (curr_close >= prev_high20 * 0.99):
-                        sl = curr_close - (2.0 * curr_atr)
-                        tgt = curr_close + (4.0 * curr_atr)
-                        qty = int(risk_amount / (curr_close - sl)) if (curr_close - sl) > 0 else 0
-                        swing_list.append({"Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty})
-
-                    # INTRADAY FILTER
-                    if (curr_close > curr_ema20) and (curr_rsi >= 56) and (vol_mult >= 1.5):
-                        sl = curr_close - (1.2 * curr_atr)
+                        sl = curr_close - (1.5 * curr_atr)
                         tgt = curr_close + (2.5 * curr_atr)
-                        qty = int(risk_amount / (curr_close - sl)) if (curr_close - sl) > 0 else 0
-                        intraday_list.append({"Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty})
+                        if self.risk.passes_reward_risk(curr_close, sl, tgt):
+                            pos = self.risk.position_size(curr_close, sl)
+                            qty = pos.qty if status["new_entries_allowed"] else 0
+                            swing_list.append({
+                                "Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1),
+                                "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2),
+                                "Qty": qty, "Risk_Amt": pos.risk_amount, "Position_Val": pos.position_value,
+                            })
+
+                    # INTRADAY FILTER — tightest stop (1.0x ATR): intraday
+                    # setups get cut fastest since there's no overnight room.
+                    if (curr_close > curr_ema20) and (curr_rsi >= 56) and (vol_mult >= 1.5):
+                        sl = curr_close - (1.0 * curr_atr)
+                        tgt = curr_close + (1.8 * curr_atr)
+                        if self.risk.passes_reward_risk(curr_close, sl, tgt):
+                            pos = self.risk.position_size(curr_close, sl)
+                            qty = pos.qty if status["new_entries_allowed"] else 0
+                            intraday_list.append({
+                                "Ticker": clean_symbol, "Price": round(curr_close, 2), "RSI": round(curr_rsi, 1),
+                                "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2),
+                                "Qty": qty, "Risk_Amt": pos.risk_amount, "Position_Val": pos.position_value,
+                            })
 
                     # BTST FILTER
                     day_range = curr_high - curr_low
                     close_loc = (curr_close - curr_low) / day_range if day_range > 0 else 0
                     if (close_loc >= 0.80) and (58 <= curr_rsi <= 75) and (vol_mult >= 1.5) and (curr_close > prev_close):
-                        sl = curr_close - (1.5 * curr_atr)
+                        sl = curr_close - (1.3 * curr_atr)
                         tgt = curr_close + (2.0 * curr_atr)
-                        qty = int(risk_amount / (curr_close - sl)) if (curr_close - sl) > 0 else 0
-                        btst_list.append({"Ticker": clean_symbol, "Price": round(curr_close, 2), "Close_High_%": round(close_loc * 100, 1), "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2), "Qty": qty})
+                        if self.risk.passes_reward_risk(curr_close, sl, tgt):
+                            pos = self.risk.position_size(curr_close, sl)
+                            qty = pos.qty if status["new_entries_allowed"] else 0
+                            btst_list.append({
+                                "Ticker": clean_symbol, "Price": round(curr_close, 2), "Close_High_%": round(close_loc * 100, 1),
+                                "RSI": round(curr_rsi, 1), "Vol_Mult": vol_mult, "StopLoss": round(sl, 2), "Target": round(tgt, 2),
+                                "Qty": qty, "Risk_Amt": pos.risk_amount, "Position_Val": pos.position_value,
+                            })
 
                 except Exception:
                     continue
@@ -231,11 +343,13 @@ class PaperEngine:
         if index_symbol not in VALID_INDEX_SYMBOLS:
             return None
 
+        status = self.risk_status()
+
         yf_symbol = INDEX_YF_TICKERS.get(index_symbol, "^NSEI")
         df = yf.download(yf_symbol, period="5d", interval="5m", progress=False)
         if df.empty:
             return None
-            
+
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -258,12 +372,12 @@ class PaperEngine:
             return None
 
         spot = round(price, 2)
-        
+
         if index_symbol == "NIFTY":
             lot_size = self.lot_sizes["NIFTY"]  # 65
             expiry = nearest_expiry_date(target_weekday=1) # Tuesday weekly expiry
             strike = atm_strike(spot, step=50.0)
-            
+
             try:
                 chain = self.nse_opt.fetch_chain(index_symbol)
                 spot = spot_price(chain) or spot
@@ -282,9 +396,22 @@ class PaperEngine:
         sl_premium = round(entry_premium * (1 - self.opt_stop_loss_pct), 2)
         tgt_premium = round(entry_premium * (1 + self.opt_target_pct), 2)
 
-        risk_amount = self.balance * (self.risk_per_trade_pct / 100.0)
-        risk_per_lot = (entry_premium - sl_premium) * lot_size
-        lots = int(risk_amount / risk_per_lot) if risk_per_lot > 0 else 1
+        if not self.risk.passes_reward_risk(entry_premium, sl_premium, tgt_premium):
+            log.info(f"[OPTIONS] {index_symbol} setup rejected: reward:risk below minimum.")
+            return None
+
+        pos = self.risk.position_size(entry_premium, sl_premium, lot_size=lot_size)
+
+        if not status["new_entries_allowed"]:
+            reason = ("daily loss circuit breaker tripped" if status["circuit_breaker_tripped"]
+                       else "max open positions reached")
+            lots = 0
+        elif pos.lots == 0:
+            reason = "risk budget too small for one lot at current premium"
+            lots = 0
+        else:
+            reason = None
+            lots = pos.lots
 
         return {
             "Contract Symbol": contract_name,
@@ -297,8 +424,10 @@ class PaperEngine:
             "Stop Loss": sl_premium,
             "Target": tgt_premium,
             "Lot Size": lot_size,
-            "Recommended Lots": max(1, lots),
-            "Total Capital Needed": round(entry_premium * lot_size * max(1, lots), 2)
+            "Recommended Lots": lots,
+            "Risk Amount": round(lots * lot_size * (entry_premium - sl_premium), 2) if lots else 0.0,
+            "Total Capital Needed": round(entry_premium * lot_size * lots, 2) if lots else 0.0,
+            "Blocked Reason": reason,
         }
 
     def analyze_stock(self, symbol):
@@ -306,10 +435,10 @@ class PaperEngine:
         df = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
         if df.empty:
             return {"Error": f"No data found for symbol: {symbol}"}
-            
+
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-            
+
         close = df['Close'].squeeze()
         high = df['High'].squeeze()
         low = df['Low'].squeeze()
@@ -345,6 +474,14 @@ class PaperEngine:
             f"{'✓' if c4 else '✗'} Daily volume above 20-day average"
         ]
 
+        # Stop tightened to 1.5x ATR (fast cut) with target held at a 1.67:1
+        # reward:risk so the payoff structure still justifies the tight stop.
+        sl = curr_close - (1.5 * curr_atr)
+        tgt = curr_close + (2.5 * curr_atr)
+        pos = self.risk.position_size(curr_close, sl)
+        status = self.risk_status()
+        qty = pos.qty if status["new_entries_allowed"] else 0
+
         return {
             "Symbol": ticker_symbol.replace(".NS", ""),
             "Price": round(curr_close, 2),
@@ -352,13 +489,27 @@ class PaperEngine:
             "RSI": round(curr_rsi, 1),
             "ATR": round(curr_atr, 2),
             "EMA200": round(curr_ema200, 2),
-            "StopLoss": round(curr_close - (2 * curr_atr), 2),
-            "Target": round(curr_close + (4 * curr_atr), 2),
+            "StopLoss": round(sl, 2),
+            "Target": round(tgt, 2),
+            "Qty": qty,
+            "RiskAmount": pos.risk_amount,
+            "PositionValue": pos.position_value,
             "Checklist": checklist
         }
 
     def run(self):
         log.info("Starting background automated execution...")
+
+        status = self.risk_status()
+        log.info(
+            f"[RISK] capital=₹{status['capital']} risk/trade={status['risk_per_trade_pct']}% "
+            f"(₹{status['risk_per_trade_amount']}) daily_pnl=₹{status['daily_realized_pnl']} "
+            f"open={status['open_positions']}/{status['max_open_positions']} "
+            f"breaker_tripped={status['circuit_breaker_tripped']}"
+        )
+        if not status["new_entries_allowed"]:
+            log.warning("[RISK] New entries are BLOCKED this run — sizing will show Qty/Lots = 0.")
+
         universe = self.fetch_nse_universe("NIFTY 500")
         stock_results = self.scan_all_strategies(universe, top_n=5)
         for category, df in stock_results.items():
@@ -366,15 +517,15 @@ class PaperEngine:
                 log.info(f"[{category}] Detected {len(df)} setups: {df['Ticker'].tolist()}")
             else:
                 log.info(f"[{category}] No active setups.")
-                
+
         for idx in self.options_indices:
             try:
                 sig = self.evaluate_index_options(idx)
                 if sig:
-                    log.info(f"[OPTIONS] Signal found for {idx}: {sig['Contract Symbol']}")
+                    log.info(f"[OPTIONS] Signal found for {idx}: {sig['Contract Symbol']} (lots={sig['Recommended Lots']})")
                 else:
                     log.info(f"[OPTIONS] No active setup for {idx}")
             except Exception as e:
                 log.error(f"[OPTIONS] Failed evaluating {idx}: {e}")
-                
+
         log.info("Background execution finished successfully.")
