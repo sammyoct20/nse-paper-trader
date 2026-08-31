@@ -1,6 +1,7 @@
 import io
 import os
 import time
+import math
 import logging
 import warnings
 from datetime import datetime, date, timedelta, time as dt_time
@@ -104,6 +105,33 @@ def spot_price(chain_json: dict) -> float | None:
     val = chain_json.get("records", {}).get("underlyingValue")
     return float(val) if val is not None else None
 
+def black_scholes_premium(spot: float, strike: float, t_years: float, vol: float,
+                           option_type: str, r: float = 0.065) -> float:
+    """Rough Black-Scholes estimate, used only as a fallback when a live
+    option-chain LTP isn't available (NSE's option-chain API blocks most
+    cloud/datacenter IPs — Render, AWS, etc. — with a 401/403, which is
+    the common case when this whole app runs on a hosted service rather
+    than your own machine).
+
+    This uses *realized* volatility (from recent price history) as a
+    stand-in for *implied* volatility, so it will typically price a touch
+    below real market premiums (real IV usually carries a risk premium
+    over realized vol) — but it correctly accounts for how far the strike
+    is from spot and how much time is left to expiry, which a flat
+    "spot * fixed %" guess never did. Still an approximation, not a live
+    quote — treat premiums computed this way as directional, not exact.
+    """
+    t_years = max(t_years, 1 / 365)
+    vol = max(vol, 0.05)
+    d1 = (math.log(spot / strike) + (r + 0.5 * vol ** 2) * t_years) / (vol * math.sqrt(t_years))
+    d2 = d1 - vol * math.sqrt(t_years)
+    N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
+    if option_type == "CE":
+        price = spot * N(d1) - strike * math.exp(-r * t_years) * N(d2)
+    else:
+        price = strike * math.exp(-r * t_years) * N(-d2) - spot * N(-d1)
+    return round(max(price, 0.05), 2)
+
 # -------------------------------------------------------------------
 # SCHEMA — single source of truth. ensure_schema() creates each table with
 # just an id, then runs every (column, postgres_type, sqlite_type) tuple
@@ -203,6 +231,7 @@ class PaperEngine:
         self.opt_target_pct = float(os.getenv("OPTIONS_TARGET_PCT", 0.40))
 
         self.nse_opt = NSEOptionsClient()
+        self._vol_cache = {}  # {yf_symbol: (annualized_vol, cached_at_epoch_seconds)}
 
     def _get_connection(self):
         if self.db_dsn:
@@ -454,6 +483,25 @@ class PaperEngine:
             log.warning(f"Could not fetch last price for {symbol}: {e}")
         return None
 
+    def _fetch_candles_since(self, yf_ticker: str, since_dt) -> pd.DataFrame:
+        """Core candle-fetch used by both get_candles_since() (stocks) and
+        get_index_candles_since() (options' underlying index) — takes the
+        already-correct Yahoo ticker as-is, no suffix handling."""
+        try:
+            df = yf.Ticker(yf_ticker).history(period="30d", interval="5m")
+            if df.empty:
+                return pd.DataFrame()
+
+            since_ts = pd.to_datetime(since_dt)
+            since_ts = since_ts.tz_localize("UTC") if since_ts.tzinfo is None else since_ts.tz_convert("UTC")
+            idx = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
+            df = df.set_axis(idx)
+            df = df[df.index > since_ts]
+            return df[["Open", "High", "Low", "Close"]].dropna()
+        except Exception as e:
+            log.warning(f"Could not fetch candle history for {yf_ticker}: {e}")
+            return pd.DataFrame()
+
     def get_candles_since(self, ticker: str, since_dt) -> pd.DataFrame:
         """5-minute OHLC candles for `ticker` strictly after `since_dt`.
 
@@ -465,22 +513,15 @@ class PaperEngine:
         Yahoo's ~60-day 5-minute retention window.
         """
         t = ticker if ticker.endswith(".NS") else f"{ticker}.NS"
-        try:
-            # yf.Ticker(...).history() instead of yf.download() — see the
-            # cross-contamination note in get_last_price() for why.
-            df = yf.Ticker(t).history(period="30d", interval="5m")
-            if df.empty:
-                return pd.DataFrame()
+        return self._fetch_candles_since(t, since_dt)
 
-            since_ts = pd.to_datetime(since_dt)
-            since_ts = since_ts.tz_localize("UTC") if since_ts.tzinfo is None else since_ts.tz_convert("UTC")
-            idx = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
-            df = df.set_axis(idx)
-            df = df[df.index > since_ts]
-            return df[["Open", "High", "Low", "Close"]].dropna()
-        except Exception as e:
-            log.warning(f"Could not fetch candle history for {ticker}: {e}")
-            return pd.DataFrame()
+    def get_index_candles_since(self, yf_symbol: str, since_dt) -> pd.DataFrame:
+        """Same idea as get_candles_since(), but for a raw index ticker
+        (e.g. "^NSEI") with no ".NS" suffix handling — used to replay the
+        underlying's candles for options square-off (see
+        _first_option_breach for why we replay the *underlying's* candles
+        rather than the option's own)."""
+        return self._fetch_candles_since(yf_symbol, since_dt)
 
     @staticmethod
     def _first_breach(candles: pd.DataFrame, stop: float, target: float):
@@ -581,43 +622,112 @@ class PaperEngine:
         self._apply_pnl(pnl)
         log.info(f"[OPTIONS CLOSE] id={trade_id} reason={exit_reason} exit={exit_premium} pnl={pnl:.2f} balance={self.balance:.2f}")
 
+    def _historical_volatility(self, yf_symbol: str) -> float:
+        """Annualized realized volatility from ~3 months of daily closes.
+        Feeds black_scholes_premium() when a live option-chain isn't
+        reachable. Cached for an hour — this doesn't need recomputing on
+        every 5-minute worker run."""
+        cached = self._vol_cache.get(yf_symbol)
+        if cached and (time.time() - cached[1]) < 3600:
+            return cached[0]
+        vol = 0.13  # sane fallback: roughly NIFTY's typical realized vol
+        try:
+            hist = yf.Ticker(yf_symbol).history(period="3mo", interval="1d")
+            closes = hist["Close"].dropna()
+            log_returns = np.log(closes / closes.shift(1)).dropna()
+            computed = float(log_returns.std() * np.sqrt(252))
+            if computed and computed > 0:
+                vol = computed
+        except Exception as e:
+            log.warning(f"Could not compute historical volatility for {yf_symbol}: {e}")
+        self._vol_cache[yf_symbol] = (vol, time.time())
+        return vol
+
+    def _estimate_option_premium(self, index_symbol: str, spot: float, strike: float,
+                                  expiry: str, option_type: str) -> float:
+        """Black-Scholes premium estimate using realized volatility — the
+        fallback used whenever a live option-chain LTP isn't available.
+        See black_scholes_premium()'s docstring for the accuracy caveat."""
+        yf_symbol = INDEX_YF_TICKERS.get(index_symbol, "^NSEI")
+        try:
+            expiry_date = datetime.strptime(expiry.title(), "%d-%b-%Y").date()
+            days_to_expiry = (expiry_date - date.today()).days
+        except Exception:
+            days_to_expiry = 3
+        t_years = max(days_to_expiry, 1) / 365
+        vol = self._historical_volatility(yf_symbol)
+        return black_scholes_premium(spot, strike, t_years, vol, option_type)
+
     def get_current_option_premium(self, index_symbol, strike, expiry, option_type):
         if index_symbol == "NIFTY":
             try:
                 chain = self.nse_opt.fetch_chain("NIFTY")
                 contract = get_contract(chain, strike, expiry, option_type)
-                return contract["ltp"] if contract else None
+                if contract and contract.get("ltp"):
+                    return contract["ltp"]
             except Exception as e:
-                log.warning(f"Could not fetch live NIFTY premium: {e}")
-                return None
+                log.warning(f"Could not fetch live NIFTY premium, falling back to model estimate: {e}")
+            # Chain unreachable (or strike/expiry not found) — estimate off
+            # the current spot instead of giving up. Previously this
+            # returned None here, which meant an unreachable NSE chain
+            # (the common case on cloud hosts) silently left every open
+            # NIFTY options position stuck OPEN forever, since the
+            # square-off check just skips a None reading.
+            yf_symbol = INDEX_YF_TICKERS["NIFTY"]
         else:
-            # SENSEX has no live option-chain source wired up here (same
-            # limitation as at entry) — approximate premium off the current
-            # spot using the same ratio used when the trade was opened.
-            try:
-                df = yf.download(INDEX_YF_TICKERS["SENSEX"], period="1d", interval="5m", progress=False)
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                closes = df["Close"].dropna()
-                if closes.empty:
-                    return None
-                spot_now = float(closes.iloc[-1])
-                return round(spot_now * 0.005, 2)
-            except Exception as e:
-                log.warning(f"Could not approximate SENSEX premium: {e}")
+            # SENSEX has no public NSE option-chain source — always model-estimated.
+            yf_symbol = INDEX_YF_TICKERS["SENSEX"]
+
+        try:
+            hist = yf.Ticker(yf_symbol).history(period="1d", interval="5m")
+            closes = hist["Close"].dropna()
+            if closes.empty:
                 return None
+            spot_now = float(closes.iloc[-1])
+            return self._estimate_option_premium(index_symbol, spot_now, strike, expiry, option_type)
+        except Exception as e:
+            log.warning(f"Could not estimate {index_symbol} premium: {e}")
+            return None
+
+    @staticmethod
+    def _first_option_breach(index_candles: pd.DataFrame, strike: float, expiry_date, option_type: str,
+                              vol: float, sl_premium: float, tgt_premium: float):
+        """Mirrors _first_breach() for stocks, replaying candles
+        oldest-to-newest for the first SL/target crossing — but NSE
+        exposes no historical intraday *option* premium series to replay,
+        only the underlying index's candles. So each candle's premium
+        range is estimated via Black-Scholes off that candle's own
+        High/Low spot (same realized-vol model used at entry), and we
+        look for the first candle whose estimated premium range would
+        have crossed either level. For a CE, spot High → premium High and
+        spot Low → premium Low; for a PE it's the mirror image. Same
+        "assume SL happened first on an ambiguous candle" convention as
+        stocks. Filled at the level itself, not the estimated extreme —
+        this is a model-based replay, not a real historical fill."""
+        for ts, row in index_candles.sort_index().iterrows():
+            days_left = max((expiry_date - ts.date()).days, 0)
+            t_years = max(days_left, 1) / 365
+            prem_at_spot_high = black_scholes_premium(float(row["High"]), strike, t_years, vol, option_type)
+            prem_at_spot_low = black_scholes_premium(float(row["Low"]), strike, t_years, vol, option_type)
+            if option_type == "CE":
+                candle_prem_high, candle_prem_low = prem_at_spot_high, prem_at_spot_low
+            else:
+                candle_prem_high, candle_prem_low = prem_at_spot_low, prem_at_spot_high
+            if candle_prem_low <= sl_premium:
+                return "SL HIT", sl_premium
+            if candle_prem_high >= tgt_premium:
+                return "TARGET HIT", tgt_premium
+        return None
 
     def check_and_close_options_positions(self):
-        """Auto square-off for options: closes any OPEN paper position whose
-        current premium has hit its stop-loss or target.
-
-        Unlike stocks, this can only check the *current* premium snapshot —
-        NSE's public option-chain endpoint has no historical intraday
-        premium series to replay, so a touch-and-reverse in premium between
-        worker runs can still be missed here. If that turns out to matter
-        for your use case, the fix would be to store premium snapshots to
-        the DB on every run and treat that as your own candle history going
-        forward — flag it if you want that built."""
+        """Auto square-off for options: mirrors check_and_close_stock_positions
+        — replays the underlying index's 5-min candles since entry (not
+        just a single latest snapshot) so a touch-and-reverse move between
+        worker runs still gets captured. Since NSE has no historical
+        intraday *option* premium series, each candle's premium range is
+        estimated via Black-Scholes off that candle's own High/Low (see
+        _first_option_breach). Falls back to a live current-snapshot check
+        only when no candle history is available at all."""
         if not is_market_open():
             log.info("[MARKET] Market closed — skipping options square-off check.")
             return
@@ -626,13 +736,33 @@ class PaperEngine:
         cur = conn.cursor()
         cur.execute(
             "SELECT id, index_symbol, option_type, strike, expiry, lot_size, lots, "
-            "entry_premium, stop_loss_premium, target_premium FROM options_trades WHERE status = 'OPEN'"
+            "entry_premium, stop_loss_premium, target_premium, entry_time FROM options_trades WHERE status = 'OPEN'"
         )
         open_rows = cur.fetchall()
         conn.close()
 
         for (trade_id, index_symbol, option_type, strike, expiry, lot_size, lots,
-             entry_premium, sl_premium, tgt_premium) in open_rows:
+             entry_premium, sl_premium, tgt_premium, entry_time) in open_rows:
+            time.sleep(0.3)  # brief pacing between per-symbol requests
+            yf_symbol = INDEX_YF_TICKERS.get(index_symbol, "^NSEI")
+            candles = self.get_index_candles_since(yf_symbol, entry_time) if entry_time else pd.DataFrame()
+
+            if not candles.empty:
+                try:
+                    expiry_date = datetime.strptime(expiry.title(), "%d-%b-%Y").date()
+                except Exception:
+                    expiry_date = date.today()
+                vol = self._historical_volatility(yf_symbol)
+                breach = self._first_option_breach(candles, strike, expiry_date, option_type, vol, sl_premium, tgt_premium)
+                if breach:
+                    reason, exit_premium = breach
+                    pnl = round((exit_premium - entry_premium) * lot_size * lots, 2)
+                    self.close_options_trade(trade_id, exit_premium, reason, pnl)
+                continue  # covered by candle replay either way — nothing missed
+
+            # Fallback only: no candle history available (e.g. brand-new
+            # position with no post-entry candle yet) — check the current
+            # live/estimated premium as a single point-in-time snapshot.
             current = self.get_current_option_premium(index_symbol, strike, expiry, option_type)
             if current is None:
                 continue
@@ -668,6 +798,14 @@ class PaperEngine:
         if not combined.empty:
             combined["entry_time"] = pd.to_datetime(combined["entry_time"])
             combined = combined.sort_values("entry_time", ascending=False).head(limit).reset_index(drop=True)
+
+            # Timestamps are stored in UTC (CURRENT_TIMESTAMP) but the
+            # dashboard is used from India — convert to IST for display so
+            # e.g. "03:48" (UTC, actually 09:18 IST — right at market open)
+            # doesn't look like an off-hours trade.
+            for col in ("entry_time", "exit_time"):
+                ts = pd.to_datetime(combined[col], utc=True, errors="coerce")
+                combined[col] = ts.dt.tz_convert(IST).dt.tz_localize(None)
         return combined
 
     def fetch_nse_universe(self, index_name="NIFTY 500"):
@@ -849,12 +987,9 @@ class PaperEngine:
         status = self.risk_status()
 
         yf_symbol = INDEX_YF_TICKERS.get(index_symbol, "^NSEI")
-        df = yf.download(yf_symbol, period="5d", interval="5m", progress=False)
+        df = yf.Ticker(yf_symbol).history(period="5d", interval="5m")
         if df.empty:
             return None
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
 
         df['ema_fast'] = df['Close'].ewm(span=20, min_periods=20).mean()
         df['ema_slow'] = df['Close'].ewm(span=50, min_periods=50).mean()
@@ -885,15 +1020,16 @@ class PaperEngine:
                 chain = self.nse_opt.fetch_chain(index_symbol)
                 spot = spot_price(chain) or spot
                 contract = get_contract(chain, strike, expiry, direction)
-                entry_premium = contract["ltp"] if (contract and contract.get("ltp")) else round(spot * 0.006, 2)
+                entry_premium = (contract["ltp"] if (contract and contract.get("ltp"))
+                                  else self._estimate_option_premium(index_symbol, spot, strike, expiry, direction))
             except Exception:
-                entry_premium = round(spot * 0.006, 2)
+                entry_premium = self._estimate_option_premium(index_symbol, spot, strike, expiry, direction)
 
         else:  # SENSEX
             lot_size = self.lot_sizes["SENSEX"]  # 20
             expiry = nearest_expiry_date(target_weekday=3) # Thursday weekly expiry
             strike = atm_strike(spot, step=100.0)
-            entry_premium = round(spot * 0.005, 2)
+            entry_premium = self._estimate_option_premium(index_symbol, spot, strike, expiry, direction)
 
         contract_name = f"{index_symbol} {int(strike)} {direction} {expiry}"
         sl_premium = round(entry_premium * (1 - self.opt_stop_loss_pct), 2)
