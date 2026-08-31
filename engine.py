@@ -80,6 +80,62 @@ def spot_price(chain_json: dict) -> float | None:
     return float(val) if val is not None else None
 
 # -------------------------------------------------------------------
+# SCHEMA — single source of truth. ensure_schema() creates each table with
+# just an id, then runs every (column, postgres_type, sqlite_type) tuple
+# below through an ALTER TABLE ... ADD COLUMN pass every startup. This makes
+# schema self-healing: if a table already exists in production (e.g. from
+# an earlier deployment) but is missing newer columns, it gets patched up
+# instead of silently staying stale, since CREATE TABLE IF NOT EXISTS is a
+# no-op on an existing table and won't add anything by itself.
+# -------------------------------------------------------------------
+OPTIONS_TRADES_COLUMNS = [
+    ("contract_name", "TEXT", "TEXT"),
+    ("index_symbol", "TEXT", "TEXT"),
+    ("option_type", "TEXT", "TEXT"),
+    ("strike", "FLOAT", "REAL"),
+    ("expiry", "TEXT", "TEXT"),
+    ("lot_size", "INT", "INTEGER"),
+    ("lots", "INT", "INTEGER"),
+    ("entry_premium", "FLOAT", "REAL"),
+    ("stop_loss_premium", "FLOAT", "REAL"),
+    ("target_premium", "FLOAT", "REAL"),
+    ("risk_amount", "FLOAT", "REAL"),
+    ("position_value", "FLOAT", "REAL"),
+    ("status", "TEXT DEFAULT 'OPEN'", "TEXT DEFAULT 'OPEN'"),
+    # No DEFAULT CURRENT_TIMESTAMP here: SQLite refuses to ADD COLUMN with a
+    # non-constant default on a table that already has rows ("Cannot add a
+    # column with non-constant default"). entry_time/updated_at are set
+    # explicitly in every INSERT/UPDATE below instead.
+    ("entry_time", "TIMESTAMP", "TIMESTAMP"),
+    ("exit_time", "TIMESTAMP", "TIMESTAMP"),
+    ("exit_premium", "FLOAT", "REAL"),
+    ("exit_reason", "TEXT", "TEXT"),
+    ("pnl", "FLOAT", "REAL"),
+]
+
+STOCK_TRADES_COLUMNS = [
+    ("ticker", "TEXT", "TEXT"),
+    ("strategy", "TEXT", "TEXT"),
+    ("entry_price", "FLOAT", "REAL"),
+    ("stop_loss", "FLOAT", "REAL"),
+    ("target", "FLOAT", "REAL"),
+    ("qty", "INT", "INTEGER"),
+    ("risk_amount", "FLOAT", "REAL"),
+    ("position_value", "FLOAT", "REAL"),
+    ("status", "TEXT DEFAULT 'OPEN'", "TEXT DEFAULT 'OPEN'"),
+    ("entry_time", "TIMESTAMP", "TIMESTAMP"),  # set explicitly on INSERT — see note above
+    ("exit_time", "TIMESTAMP", "TIMESTAMP"),
+    ("exit_price", "FLOAT", "REAL"),
+    ("exit_reason", "TEXT", "TEXT"),
+    ("pnl", "FLOAT", "REAL"),
+]
+
+ACCOUNT_STATE_COLUMNS = [
+    ("capital", "FLOAT", "REAL"),
+    ("updated_at", "TIMESTAMP", "TIMESTAMP"),  # set explicitly on INSERT/UPDATE — see note above
+]
+
+# -------------------------------------------------------------------
 # MAIN CORE ENGINE: PAPER ENGINE (STOCKS & OPTIONS)
 # -------------------------------------------------------------------
 class PaperEngine:
@@ -133,70 +189,44 @@ class PaperEngine:
     def ensure_schema(self):
         conn = self._get_connection()
         cur = conn.cursor()
+
         if self.db_dsn:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS options_trades (
-                id SERIAL PRIMARY KEY, contract_name TEXT, index_symbol TEXT, option_type TEXT,
-                strike FLOAT, expiry TEXT, lot_size INT, lots INT,
-                entry_premium FLOAT, stop_loss_premium FLOAT, target_premium FLOAT,
-                risk_amount FLOAT, position_value FLOAT,
-                status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                exit_time TIMESTAMP, exit_premium FLOAT, exit_reason TEXT, pnl FLOAT
-            );
-            """)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS stock_trades (
-                id SERIAL PRIMARY KEY, ticker TEXT, strategy TEXT,
-                entry_price FLOAT, stop_loss FLOAT, target FLOAT, qty INT,
-                risk_amount FLOAT, position_value FLOAT,
-                status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                exit_time TIMESTAMP, exit_price FLOAT, exit_reason TEXT, pnl FLOAT
-            );
-            """)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS account_state (
-                id INT PRIMARY KEY, capital FLOAT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
+            cur.execute("CREATE TABLE IF NOT EXISTS options_trades (id SERIAL PRIMARY KEY)")
+            cur.execute("CREATE TABLE IF NOT EXISTS stock_trades (id SERIAL PRIMARY KEY)")
+            cur.execute("CREATE TABLE IF NOT EXISTS account_state (id INT PRIMARY KEY)")
         else:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS options_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, contract_name TEXT, index_symbol TEXT, option_type TEXT,
-                strike REAL, expiry TEXT, lot_size INTEGER, lots INTEGER,
-                entry_premium REAL, stop_loss_premium REAL, target_premium REAL,
-                risk_amount REAL, position_value REAL,
-                status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                exit_time TIMESTAMP, exit_premium REAL, exit_reason TEXT, pnl REAL
-            );
-            """)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS stock_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, strategy TEXT,
-                entry_price REAL, stop_loss REAL, target REAL, qty INTEGER,
-                risk_amount REAL, position_value REAL,
-                status TEXT DEFAULT 'OPEN', entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                exit_time TIMESTAMP, exit_price REAL, exit_reason TEXT, pnl REAL
-            );
-            """)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS account_state (
-                id INTEGER PRIMARY KEY, capital REAL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
+            cur.execute("CREATE TABLE IF NOT EXISTS options_trades (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            cur.execute("CREATE TABLE IF NOT EXISTS stock_trades (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            cur.execute("CREATE TABLE IF NOT EXISTS account_state (id INTEGER PRIMARY KEY)")
         conn.commit()
 
-        # Best-effort migration for options_trades created before
-        # risk_amount / position_value existed — harmless if already there.
-        for col in ("risk_amount", "position_value"):
-            coltype = "FLOAT" if self.db_dsn else "REAL"
-            try:
-                cur.execute(f"ALTER TABLE options_trades ADD COLUMN {col} {coltype}")
-                conn.commit()
-            except Exception:
-                if self.db_dsn:
-                    conn.rollback()
+        # Every table is created with just an id above, then every expected
+        # column is patched in here. This runs on every startup and is a
+        # no-op once columns exist, but it means a pre-existing production
+        # table missing newer columns (from an earlier deployment) gets
+        # healed automatically instead of throwing "column does not exist"
+        # at query time.
+        self._ensure_columns(cur, conn, "options_trades", OPTIONS_TRADES_COLUMNS)
+        self._ensure_columns(cur, conn, "stock_trades", STOCK_TRADES_COLUMNS)
+        self._ensure_columns(cur, conn, "account_state", ACCOUNT_STATE_COLUMNS)
 
         conn.close()
+
+    def _ensure_columns(self, cur, conn, table: str, columns: list):
+        for col, pg_type, sqlite_type in columns:
+            if self.db_dsn:
+                try:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {pg_type}")
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    log.warning(f"Could not ensure column {table}.{col}: {e}")
+            else:
+                try:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sqlite_type}")
+                    conn.commit()
+                except Exception:
+                    pass  # column already exists — sqlite has no IF NOT EXISTS for ADD COLUMN
 
     # -----------------------------------------------------------------
     # ACCOUNT CAPITAL — persisted so it survives restarts across cron runs
@@ -210,7 +240,7 @@ class PaperEngine:
 
         if row is None:
             capital = float(initial_balance)
-            cur.execute(f"INSERT INTO account_state (id, capital) VALUES (1, {self.ph})", (capital,))
+            cur.execute(f"INSERT INTO account_state (id, capital, updated_at) VALUES (1, {self.ph}, CURRENT_TIMESTAMP)", (capital,))
             conn.commit()
         elif reset:
             capital = float(initial_balance)
@@ -312,8 +342,8 @@ class PaperEngine:
         cur = conn.cursor()
         cur.execute(
             f"""INSERT INTO stock_trades
-                (ticker, strategy, entry_price, stop_loss, target, qty, risk_amount, position_value, status)
-                VALUES ({self.ph},{self.ph},{self.ph},{self.ph},{self.ph},{self.ph},{self.ph},{self.ph},'OPEN')""",
+                (ticker, strategy, entry_price, stop_loss, target, qty, risk_amount, position_value, status, entry_time)
+                VALUES ({self.ph},{self.ph},{self.ph},{self.ph},{self.ph},{self.ph},{self.ph},{self.ph},'OPEN',CURRENT_TIMESTAMP)""",
             (ticker, strategy, entry, stop, target, qty, risk_amount, position_value),
         )
         conn.commit()
@@ -412,7 +442,7 @@ class PaperEngine:
         conn.close()
 
         for trade_id, ticker, entry, stop, target, qty, entry_time in open_rows:
-            candles = self.get_candles_since(ticker, entry_time)
+            candles = self.get_candles_since(ticker, entry_time) if entry_time else pd.DataFrame()
 
             if not candles.empty:
                 breach = self._first_breach(candles, stop, target)
@@ -453,9 +483,9 @@ class PaperEngine:
         cur.execute(
             f"""INSERT INTO options_trades
                 (contract_name, index_symbol, option_type, strike, expiry, lot_size, lots,
-                 entry_premium, stop_loss_premium, target_premium, risk_amount, position_value, status)
+                 entry_premium, stop_loss_premium, target_premium, risk_amount, position_value, status, entry_time)
                 VALUES ({self.ph},{self.ph},{self.ph},{self.ph},{self.ph},{self.ph},{self.ph},
-                         {self.ph},{self.ph},{self.ph},{self.ph},{self.ph},'OPEN')""",
+                         {self.ph},{self.ph},{self.ph},{self.ph},{self.ph},'OPEN',CURRENT_TIMESTAMP)""",
             (
                 signal["Contract Symbol"], signal["Index"], signal["Direction"], signal["Strike"], signal["Expiry"],
                 signal["Lot Size"], signal["Recommended Lots"], signal["Premium (LTP)"], signal["Stop Loss"],
