@@ -65,7 +65,13 @@ def atm_strike(spot_price: float, step: float = 50.0) -> float:
 
 def get_contract(chain_json: dict, strike: float, expiry: str, option_type: str) -> dict | None:
     for row in chain_json.get("records", {}).get("data", []):
-        if row.get("strikePrice") == strike and row.get("expiryDate") == expiry:
+        # Case-insensitive expiry match: we store expiry as "04-SEP-2025"
+        # (nearest_expiry_date() upper-cases it) but NSE's live chain
+        # returns "04-Sep-2025" (mixed case), so a plain == comparison
+        # silently never matched — every option lookup fell through to
+        # the entry_premium fallback, and the same lookup also failed
+        # when checking whether to auto-close the position.
+        if row.get("strikePrice") == strike and str(row.get("expiryDate", "")).upper() == str(expiry).upper():
             leg = row.get(option_type)
             if leg and leg.get("lastPrice") is not None:
                 return {
@@ -365,22 +371,31 @@ class PaperEngine:
 
     def get_last_price(self, symbol: str):
         """Best-effort *current* price — used only as a fallback when no
-        intraday candle history is available (see get_candles_since)."""
+        intraday candle history is available (see get_candles_since).
+
+        Uses yf.Ticker(...).history() — an isolated, single-symbol request
+        — rather than the module-level yf.download() helper. yf.download()
+        shares internal caching/threading state across calls, and this
+        method is called once per open position, back-to-back, on every
+        worker run. Under that rapid-fire pattern yf.download() has been
+        observed to hand back a *different* ticker's candle data under the
+        requested symbol's own columns, which was then accepted at face
+        value — closing trades at a price that belonged to another stock
+        entirely (e.g. a ~150 rupee stock being "closed" at ~4500 because
+        another open ticker's price leaked in). Ticker.history() issues an
+        independent request per symbol and avoids that shared state.
+        """
         ticker = symbol if symbol.endswith(".NS") else f"{symbol}.NS"
         try:
-            df = yf.download(ticker, period="1d", interval="5m", progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            closes = df["Close"].dropna()
+            hist = yf.Ticker(ticker).history(period="1d", interval="5m")
+            closes = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
             if not closes.empty:
                 return float(closes.iloc[-1])
         except Exception:
             pass
         try:
-            df = yf.download(ticker, period="5d", interval="1d", progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            closes = df["Close"].dropna()
+            hist = yf.Ticker(ticker).history(period="5d", interval="1d")
+            closes = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
             if not closes.empty:
                 return float(closes.iloc[-1])
         except Exception as e:
@@ -399,9 +414,9 @@ class PaperEngine:
         """
         t = ticker if ticker.endswith(".NS") else f"{ticker}.NS"
         try:
-            df = yf.download(t, period="30d", interval="5m", progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            # yf.Ticker(...).history() instead of yf.download() — see the
+            # cross-contamination note in get_last_price() for why.
+            df = yf.Ticker(t).history(period="30d", interval="5m")
             if df.empty:
                 return pd.DataFrame()
 
@@ -442,6 +457,7 @@ class PaperEngine:
         conn.close()
 
         for trade_id, ticker, entry, stop, target, qty, entry_time in open_rows:
+            time.sleep(0.3)  # brief pacing between per-symbol requests
             candles = self.get_candles_since(ticker, entry_time) if entry_time else pd.DataFrame()
 
             if not candles.empty:
