@@ -3,7 +3,8 @@ import os
 import time
 import logging
 import warnings
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
 import numpy as np
@@ -15,6 +16,24 @@ from risk_manager import RiskManager
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("unified_engine")
+
+# -------------------------------------------------------------------
+# MARKET HOURS GUARD — NSE cash/index market: Mon–Fri, 09:15–15:30 IST.
+# run() (the worker.py entry point) checks this before doing anything, so
+# a cron/Action that fires outside market hours — or a manual trigger
+# during off-hours — no-ops instead of opening/closing paper positions
+# against stale or thin after-hours data. This does NOT account for NSE
+# holidays; add a holiday-date check below if that matters for you.
+# -------------------------------------------------------------------
+IST = ZoneInfo("Asia/Kolkata")
+MARKET_OPEN_TIME = dt_time(9, 15)
+MARKET_CLOSE_TIME = dt_time(15, 30)
+
+def is_market_open(now: datetime | None = None) -> bool:
+    now = now.astimezone(IST) if now else datetime.now(IST)
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    return MARKET_OPEN_TIME <= now.time() <= MARKET_CLOSE_TIME
 
 # -------------------------------------------------------------------
 # OPTIONS CLIENT & HELPERS
@@ -152,6 +171,7 @@ class PaperEngine:
         self.db_dsn = os.getenv("DATABASE_URL")
         self.ph = "%s" if self.db_dsn else "?"  # SQL parameter placeholder style
         self.ensure_schema()
+        self._maybe_clear_closed_trades()
 
         # Capital is persisted in account_state and reloaded here, so it
         # survives across process restarts (important since GitHub Actions
@@ -237,6 +257,38 @@ class PaperEngine:
     # -----------------------------------------------------------------
     # ACCOUNT CAPITAL — persisted so it survives restarts across cron runs
     # -----------------------------------------------------------------
+    def _maybe_clear_closed_trades(self):
+        """One-time cleanup for the ticker-cross-contamination / off-hours
+        bug: deletes every CLOSED row from both trade tables so the wrong
+        entry/exit pairs stop showing up on the dashboard. Runs only when
+        CLEAR_CLOSED_TRADES_ON_START=true is set, so a normal restart never
+        touches trade history.
+
+        IMPORTANT: this runs on every process start while the env var is
+        set — including every redeploy. Set it to true, deploy once, watch
+        the logs for the "[CLEANUP]" line confirming it ran, then remove
+        the variable (or set it back to false) and redeploy again so it
+        doesn't keep wiping future closed trades.
+        """
+        if os.getenv("CLEAR_CLOSED_TRADES_ON_START", "false").lower() != "true":
+            return
+        try:
+            conn = self._get_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM stock_trades WHERE status = 'CLOSED'")
+            n_stock = cur.rowcount
+            cur.execute("DELETE FROM options_trades WHERE status = 'CLOSED'")
+            n_opt = cur.rowcount
+            conn.commit()
+            conn.close()
+            log.warning(
+                f"[CLEANUP] CLEAR_CLOSED_TRADES_ON_START=true \u2014 deleted "
+                f"{n_stock} closed stock trades and {n_opt} closed options trades. "
+                f"Remove this env var now so future restarts don't keep wiping history."
+            )
+        except Exception as e:
+            log.warning(f"[CLEANUP] Could not clear closed trades: {e}")
+
     def _load_or_init_balance(self, initial_balance: float) -> float:
         conn = self._get_connection()
         cur = conn.cursor()
@@ -450,6 +502,10 @@ class PaperEngine:
         5-min candle since entry (not just the latest one) looking for the
         first stop-loss or target crossing, so a touch-and-reverse move
         between worker runs still gets captured correctly."""
+        if not is_market_open():
+            log.info("[MARKET] Market closed — skipping stock square-off check.")
+            return
+
         conn = self._get_connection()
         cur = conn.cursor()
         cur.execute("SELECT id, ticker, entry_price, stop_loss, target, qty, entry_time FROM stock_trades WHERE status = 'OPEN'")
@@ -562,6 +618,10 @@ class PaperEngine:
         for your use case, the fix would be to store premium snapshots to
         the DB on every run and treat that as your own candle history going
         forward — flag it if you want that built."""
+        if not is_market_open():
+            log.info("[MARKET] Market closed — skipping options square-off check.")
+            return
+
         conn = self._get_connection()
         cur = conn.cursor()
         cur.execute(
@@ -637,6 +697,10 @@ class PaperEngine:
         """
         if tickers is None:
             tickers = self.fetch_nse_universe("NIFTY 500")
+
+        if paper_trade and not is_market_open():
+            log.info("[MARKET] Market closed — scanning for display only, no paper trades will be opened.")
+            paper_trade = False
 
         status = self.risk_status()
         open_slots = max(0, self.risk.max_open_positions - status["open_positions"]) if paper_trade else None
@@ -777,6 +841,10 @@ class PaperEngine:
     def evaluate_index_options(self, index_symbol="NIFTY", paper_trade=False):
         if index_symbol not in VALID_INDEX_SYMBOLS:
             return None
+
+        if paper_trade and not is_market_open():
+            log.info("[MARKET] Market closed — evaluating for display only, no paper trade will be opened.")
+            paper_trade = False
 
         status = self.risk_status()
 
@@ -948,6 +1016,14 @@ class PaperEngine:
           3. Scan for new setups and open paper positions for the qualifying ones.
         """
         log.info("Starting background automated execution...")
+
+        if not is_market_open():
+            log.info(
+                "[MARKET] NSE market is closed right now (outside Mon\u2013Fri "
+                "09:15\u201315:30 IST) \u2014 skipping this run entirely. No positions "
+                "will be opened or closed."
+            )
+            return
 
         self.check_and_close_stock_positions()
         self.check_and_close_options_positions()
