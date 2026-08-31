@@ -7,4 +7,4 @@ print("Time:", datetime.now())
 engine = PaperEngine()
 engine.run()
 
-print("✅ Done")
+print(f"✅ Done | Capital: ₹{engine.balance:,.2f}")

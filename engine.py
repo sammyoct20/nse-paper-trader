@@ -334,7 +334,8 @@ class PaperEngine:
         log.info(f"[STOCK CLOSE] id={trade_id} reason={exit_reason} exit={exit_price} pnl={pnl:.2f} balance={self.balance:.2f}")
 
     def get_last_price(self, symbol: str):
-        """Best-effort current price for square-off checks."""
+        """Best-effort *current* price — used only as a fallback when no
+        intraday candle history is available (see get_candles_since)."""
         ticker = symbol if symbol.endswith(".NS") else f"{symbol}.NS"
         try:
             df = yf.download(ticker, period="1d", interval="5m", progress=False)
@@ -356,17 +357,74 @@ class PaperEngine:
             log.warning(f"Could not fetch last price for {symbol}: {e}")
         return None
 
+    def get_candles_since(self, ticker: str, since_dt) -> pd.DataFrame:
+        """5-minute OHLC candles for `ticker` strictly after `since_dt`.
+
+        This is what lets the square-off check catch a stop/target that was
+        touched and reverted *between* two worker runs: instead of only
+        looking at the latest price, it re-scans every candle since the
+        trade was opened, every single run — so a delayed or skipped run
+        doesn't cause a missed fill, as long as the candle is still inside
+        Yahoo's ~60-day 5-minute retention window.
+        """
+        t = ticker if ticker.endswith(".NS") else f"{ticker}.NS"
+        try:
+            df = yf.download(t, period="30d", interval="5m", progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if df.empty:
+                return pd.DataFrame()
+
+            since_ts = pd.to_datetime(since_dt)
+            since_ts = since_ts.tz_localize("UTC") if since_ts.tzinfo is None else since_ts.tz_convert("UTC")
+            idx = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
+            df = df.set_axis(idx)
+            df = df[df.index > since_ts]
+            return df[["Open", "High", "Low", "Close"]].dropna()
+        except Exception as e:
+            log.warning(f"Could not fetch candle history for {ticker}: {e}")
+            return pd.DataFrame()
+
+    @staticmethod
+    def _first_breach(candles: pd.DataFrame, stop: float, target: float):
+        """Scans candles oldest-to-newest; returns ('SL HIT', stop) or
+        ('TARGET HIT', target) for the first candle whose High/Low range
+        crosses either level, filled at the level itself (not the candle
+        extreme). If one candle's range crosses both — a big whipsaw bar —
+        SL is assumed to have happened first, per Kotegawa's capital-first
+        discipline: when in doubt about fill order, assume the loss."""
+        for _, row in candles.sort_index().iterrows():
+            if row["Low"] <= stop:
+                return "SL HIT", stop
+            if row["High"] >= target:
+                return "TARGET HIT", target
+        return None
+
     def check_and_close_stock_positions(self):
-        """Auto square-off: closes any OPEN equity paper trade whose latest
-        price has hit its stop-loss or target. This is what actually makes
-        Qty/StopLoss/Target mean something beyond a suggestion."""
+        """Auto square-off: for every OPEN equity paper trade, replays every
+        5-min candle since entry (not just the latest one) looking for the
+        first stop-loss or target crossing, so a touch-and-reverse move
+        between worker runs still gets captured correctly."""
         conn = self._get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, ticker, entry_price, stop_loss, target, qty FROM stock_trades WHERE status = 'OPEN'")
+        cur.execute("SELECT id, ticker, entry_price, stop_loss, target, qty, entry_time FROM stock_trades WHERE status = 'OPEN'")
         open_rows = cur.fetchall()
         conn.close()
 
-        for trade_id, ticker, entry, stop, target, qty in open_rows:
+        for trade_id, ticker, entry, stop, target, qty, entry_time in open_rows:
+            candles = self.get_candles_since(ticker, entry_time)
+
+            if not candles.empty:
+                breach = self._first_breach(candles, stop, target)
+                if breach:
+                    reason, exit_price = breach
+                    pnl = round((exit_price - entry) * qty, 2)
+                    self.close_stock_trade(trade_id, exit_price, reason, pnl)
+                continue  # covered by candle history either way — nothing missed
+
+            # Fallback only: no intraday candle history available at all
+            # (e.g. trade is older than the ~60-day 5m retention window) —
+            # check the latest price as a single point-in-time snapshot.
             price = self.get_last_price(ticker)
             if price is None:
                 continue
@@ -449,7 +507,15 @@ class PaperEngine:
 
     def check_and_close_options_positions(self):
         """Auto square-off for options: closes any OPEN paper position whose
-        current premium has hit its stop-loss or target."""
+        current premium has hit its stop-loss or target.
+
+        Unlike stocks, this can only check the *current* premium snapshot —
+        NSE's public option-chain endpoint has no historical intraday
+        premium series to replay, so a touch-and-reverse in premium between
+        worker runs can still be missed here. If that turns out to matter
+        for your use case, the fix would be to store premium snapshots to
+        the DB on every run and treat that as your own candle history going
+        forward — flag it if you want that built."""
         conn = self._get_connection()
         cur = conn.cursor()
         cur.execute(
