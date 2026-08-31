@@ -157,6 +157,11 @@ with tab6:
         closed_df = log_df[log_df["status"] == "CLOSED"]
 
         st.markdown("### 🟢 Open Positions")
+        st.caption(
+            "'entry' is the price/premium recorded when the trade was opened and never changes. "
+            "'current' is a live mark (or, for options when NSE's live chain is unreachable — the "
+            "common case on Render — a model-estimated premium) refreshed each time this tab loads."
+        )
         if not open_df.empty:
             st.dataframe(open_df.drop(columns=["exit_time", "exit_price", "exit_reason"]), use_container_width=True)
         else:
@@ -164,7 +169,7 @@ with tab6:
 
         st.markdown("### ⚪ Closed Trades")
         if not closed_df.empty:
-            st.dataframe(closed_df, use_container_width=True)
+            st.dataframe(closed_df.drop(columns=["current", "unrealized_pnl"], errors="ignore"), use_container_width=True)
             wins = (closed_df["pnl"] > 0).sum()
             total_closed = len(closed_df)
             win_rate = round(100 * wins / total_closed, 1) if total_closed else 0.0
