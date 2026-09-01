@@ -30,21 +30,6 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN_TIME = dt_time(9, 15)
 MARKET_CLOSE_TIME = dt_time(15, 30)
 
-# INTRADAY paper positions (stock strategy == "INTRADAY") and ALL index
-# options positions (the options strategy here is a same-day 5-min
-# trend/RSI breakout — there is no overnight-hold logic for it anywhere
-# in this file) must be force-closed before the cash market shuts, the
-# same way a real broker auto-squares-off MIS positions. Previously
-# nothing did this: check_and_close_stock_positions() /
-# check_and_close_options_positions() only closed a position early if
-# its SL/target was hit, and run() no-ops entirely once
-# is_market_open() goes False — so anything still open at 15:30 that
-# hadn't hit SL/target just sat OPEN indefinitely (and got evaluated
-# against the *next* trading day's candles as if it were a swing trade
-# on the following square-off check). 15:15 leaves a couple of 5-min
-# worker cycles before the 15:30 close to actually execute the closure.
-EOD_SQUAREOFF_TIME = dt_time(15, 15)
-
 def is_market_open(now: datetime | None = None) -> bool:
     now = now.astimezone(IST) if now else datetime.now(IST)
     if now.weekday() >= 5:  # Saturday=5, Sunday=6
@@ -557,27 +542,18 @@ class PaperEngine:
         """Auto square-off: for every OPEN equity paper trade, replays every
         5-min candle since entry (not just the latest one) looking for the
         first stop-loss or target crossing, so a touch-and-reverse move
-        between worker runs still gets captured correctly.
-
-        INTRADAY-strategy positions get an extra check: once IST time has
-        passed EOD_SQUAREOFF_TIME, any that haven't hit SL/target yet are
-        force-closed at the current price with reason "EOD SQUARE-OFF" —
-        mirroring a real broker's MIS auto-square-off. SWING and BTST
-        positions are meant to be held past the same day, so they're left
-        alone here regardless of the time."""
+        between worker runs still gets captured correctly."""
         if not is_market_open():
             log.info("[MARKET] Market closed — skipping stock square-off check.")
             return
 
-        force_eod = datetime.now(IST).time() >= EOD_SQUAREOFF_TIME
-
         conn = self._get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, ticker, strategy, entry_price, stop_loss, target, qty, entry_time FROM stock_trades WHERE status = 'OPEN'")
+        cur.execute("SELECT id, ticker, entry_price, stop_loss, target, qty, entry_time FROM stock_trades WHERE status = 'OPEN'")
         open_rows = cur.fetchall()
         conn.close()
 
-        for trade_id, ticker, strategy, entry, stop, target, qty, entry_time in open_rows:
+        for trade_id, ticker, entry, stop, target, qty, entry_time in open_rows:
             time.sleep(0.3)  # brief pacing between per-symbol requests
             candles = self.get_candles_since(ticker, entry_time) if entry_time else pd.DataFrame()
 
@@ -587,11 +563,6 @@ class PaperEngine:
                     reason, exit_price = breach
                     pnl = round((exit_price - entry) * qty, 2)
                     self.close_stock_trade(trade_id, exit_price, reason, pnl)
-                    continue
-                if strategy == "INTRADAY" and force_eod:
-                    price = round(float(candles["Close"].iloc[-1]), 2)
-                    pnl = round((price - entry) * qty, 2)
-                    self.close_stock_trade(trade_id, price, "EOD SQUARE-OFF", pnl)
                 continue  # covered by candle history either way — nothing missed
 
             # Fallback only: no intraday candle history available at all
@@ -606,9 +577,6 @@ class PaperEngine:
             elif price >= target:
                 pnl = round((price - entry) * qty, 2)
                 self.close_stock_trade(trade_id, round(price, 2), "TARGET HIT", pnl)
-            elif strategy == "INTRADAY" and force_eod:
-                pnl = round((price - entry) * qty, 2)
-                self.close_stock_trade(trade_id, round(price, 2), "EOD SQUARE-OFF", pnl)
             # else: still running, leave OPEN
 
     # -----------------------------------------------------------------
@@ -759,19 +727,10 @@ class PaperEngine:
         intraday *option* premium series, each candle's premium range is
         estimated via Black-Scholes off that candle's own High/Low (see
         _first_option_breach). Falls back to a live current-snapshot check
-        only when no candle history is available at all.
-
-        These positions are entered off a same-day 5-min trend/RSI
-        breakout with no overnight-hold logic anywhere in this file, so —
-        same as INTRADAY stock positions — anything still OPEN once IST
-        time passes EOD_SQUAREOFF_TIME gets force-closed at the current
-        premium with reason "EOD SQUARE-OFF" instead of being left open
-        past the close."""
+        only when no candle history is available at all."""
         if not is_market_open():
             log.info("[MARKET] Market closed — skipping options square-off check.")
             return
-
-        force_eod = datetime.now(IST).time() >= EOD_SQUAREOFF_TIME
 
         conn = self._get_connection()
         cur = conn.cursor()
@@ -799,12 +758,6 @@ class PaperEngine:
                     reason, exit_premium = breach
                     pnl = round((exit_premium - entry_premium) * lot_size * lots, 2)
                     self.close_options_trade(trade_id, exit_premium, reason, pnl)
-                    continue
-                if force_eod:
-                    current = self.get_current_option_premium(index_symbol, strike, expiry, option_type)
-                    if current is not None:
-                        pnl = round((current - entry_premium) * lot_size * lots, 2)
-                        self.close_options_trade(trade_id, current, "EOD SQUARE-OFF", pnl)
                 continue  # covered by candle replay either way — nothing missed
 
             # Fallback only: no candle history available (e.g. brand-new
@@ -819,41 +772,23 @@ class PaperEngine:
             elif current >= tgt_premium:
                 pnl = round((current - entry_premium) * lot_size * lots, 2)
                 self.close_options_trade(trade_id, current, "TARGET HIT", pnl)
-            elif force_eod:
-                pnl = round((current - entry_premium) * lot_size * lots, 2)
-                self.close_options_trade(trade_id, current, "EOD SQUARE-OFF", pnl)
             # else: still running, leave OPEN
 
     # -----------------------------------------------------------------
     # TRADE LOG (for the dashboard)
     # -----------------------------------------------------------------
-    def get_trade_log(self, limit=100, include_live_mark: bool = True) -> pd.DataFrame:
-        """`entry` was previously the ONLY price column shown for OPEN
-        positions in the dashboard — it's the price/premium recorded at
-        trade-open time and never changes after that. With EOD square-off
-        now closing everything by end of day, a still-OPEN row means the
-        market is live and "entry" is stale by definition, which read as
-        the dashboard showing a wrong/frozen premium. When
-        include_live_mark=True (the dashboard's use), OPEN rows get a
-        `current` column (live price for stocks, live-or-modeled premium
-        for options — see get_current_option_premium's cloud-IP-block
-        caveat) and an `unrealized_pnl` column computed from it; CLOSED
-        rows get NaN for both since exit_price already is the real fill."""
+    def get_trade_log(self, limit=100) -> pd.DataFrame:
         conn = self._get_connection()
         try:
             stocks = pd.read_sql_query(
                 f"SELECT 'STOCK' AS asset_type, ticker AS symbol, strategy, entry_price AS entry, "
-                f"stop_loss AS stop, target, qty, status, entry_time, exit_time, exit_price, exit_reason, pnl, "
-                f"ticker AS _ticker, NULL AS _index_symbol, NULL AS _strike, NULL AS _expiry, NULL AS _option_type, "
-                f"NULL AS _lot_size "
+                f"stop_loss AS stop, target, qty, status, entry_time, exit_time, exit_price, exit_reason, pnl "
                 f"FROM stock_trades ORDER BY entry_time DESC LIMIT {int(limit)}", conn,
             )
             options = pd.read_sql_query(
                 f"SELECT 'OPTION' AS asset_type, contract_name AS symbol, option_type AS strategy, "
                 f"entry_premium AS entry, stop_loss_premium AS stop, target_premium AS target, lots AS qty, "
-                f"status, entry_time, exit_time, exit_premium AS exit_price, exit_reason, pnl, "
-                f"NULL AS _ticker, index_symbol AS _index_symbol, strike AS _strike, expiry AS _expiry, "
-                f"option_type AS _option_type, lot_size AS _lot_size "
+                f"status, entry_time, exit_time, exit_premium AS exit_price, exit_reason, pnl "
                 f"FROM options_trades ORDER BY entry_time DESC LIMIT {int(limit)}", conn,
             )
         finally:
@@ -871,32 +806,7 @@ class PaperEngine:
             for col in ("entry_time", "exit_time"):
                 ts = pd.to_datetime(combined[col], utc=True, errors="coerce")
                 combined[col] = ts.dt.tz_convert(IST).dt.tz_localize(None)
-
-            combined["current"] = np.nan
-            combined["unrealized_pnl"] = np.nan
-            if include_live_mark:
-                open_mask = combined["status"] == "OPEN"
-                for idx in combined[open_mask].index:
-                    row = combined.loc[idx]
-                    try:
-                        if row["asset_type"] == "STOCK":
-                            live = self.get_last_price(row["_ticker"])
-                            mult = row["qty"]
-                        else:
-                            live = self.get_current_option_premium(
-                                row["_index_symbol"], row["_strike"], row["_expiry"], row["_option_type"]
-                            )
-                            mult = row["qty"] * row["_lot_size"]
-                        if live is not None:
-                            combined.at[idx, "current"] = round(live, 2)
-                            combined.at[idx, "unrealized_pnl"] = round((live - row["entry"]) * mult, 2)
-                    except Exception as e:
-                        log.warning(f"Could not fetch live mark for {row['symbol']}: {e}")
-
-        return combined.drop(
-            columns=["_ticker", "_index_symbol", "_strike", "_expiry", "_option_type", "_lot_size"],
-            errors="ignore",
-        )
+        return combined
 
     def fetch_nse_universe(self, index_name="NIFTY 500"):
         urls = {
