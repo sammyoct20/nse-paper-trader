@@ -8,6 +8,7 @@ from datetime import datetime
 
 log = logging.getLogger("unified_engine")
 
+
 class NSELiveClient:
     """
     Direct client that fetches live quotes and historical daily candle data
@@ -70,162 +71,216 @@ class NSELiveClient:
             return pd.DataFrame()
 
 
-def close_expired_intraday_trades(self):
+class DummyRiskManager:
+    """Fallback Risk Manager if internal risk module is not imported."""
+    def __init__(self):
+        self.max_open_positions = 5
+
+    def passes_reward_risk(self, entry, sl, tgt):
+        return (tgt - entry) >= (entry - sl)
+
+    def position_size(self, entry, sl):
+        class Position:
+            qty = 10
+            risk_amount = round((entry - sl) * 10, 2)
+            position_value = round(entry * 10, 2)
+        return Position()
+
+
+class PaperEngine:
     """
-    Force-closes all open INTRADAY paper trades if market hours are over.
+    Core Trading Engine consumed by Streamlit app.py
     """
-    now = datetime.now()
-    # Check if time is past 15:15 IST (3:15 PM) or market is closed
-    if now.hour > 15 or (now.hour == 15 and now.minute >= 15):
-        if hasattr(self, "open_positions") and self.open_positions:
+    def __init__(self, risk_manager=None):
+        self.risk = risk_manager if risk_manager else DummyRiskManager()
+        self.open_positions = []
+        self.nse_client = NSELiveClient()
+
+    def risk_status(self):
+        """Returns risk and position allocation metrics."""
+        return {
+            "open_positions": len(self.open_positions),
+            "new_entries_allowed": len(self.open_positions) < self.risk.max_open_positions
+        }
+
+    def fetch_nse_universe(self, index_name="NIFTY 50"):
+        """Returns default stock universe list."""
+        return ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC"]
+
+    def _maybe_open_stock(self, paper_trade, strategy, symbol, close, sl, tgt, qty, risk_amt, pos_val, status, open_slots):
+        """Simulates opening a paper position if enabled."""
+        if paper_trade and open_slots is not None and open_slots > 0:
+            trade = {
+                "strategy": strategy,
+                "symbol": symbol,
+                "entry_price": close,
+                "current_price": close,
+                "sl": sl,
+                "tgt": tgt,
+                "qty": qty,
+                "risk_amount": risk_amt,
+                "position_value": pos_val,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            self.open_positions.append(trade)
+            return True
+        return False
+
+    def _close_position(self, trade, exit_price, reason="EOD Market Close"):
+        """Closes a position and removes it from active open positions."""
+        if trade in self.open_positions:
+            self.open_positions.remove(trade)
+            log.info(f"Position closed for {trade['symbol']} | Reason: {reason} | Exit Price: {exit_price}")
+
+    def close_expired_intraday_trades(self):
+        """
+        Force-closes all open INTRADAY paper trades if market hours are over (>= 15:15 IST).
+        """
+        now = datetime.now()
+        if now.hour > 15 or (now.hour == 15 and now.minute >= 15):
             for trade in list(self.open_positions):
                 if trade.get("strategy") == "INTRADAY":
                     current_price = trade.get("current_price", trade.get("entry_price"))
                     self._close_position(trade, exit_price=current_price, reason="EOD Market Close")
-                    log.info(f"Auto-closed INTRADAY position for {trade['symbol']} at Market Close.")
 
+    def scan_all_strategies(self, tickers=None, top_n=5, paper_trade=False):
+        """
+        Executes SWING, INTRADAY, and BTST strategy scans using official live NSE website data.
+        Auto-closes open INTRADAY trades if executed past market hours.
+        """
+        self.close_expired_intraday_trades()
 
-def scan_all_strategies(self, tickers=None, top_n=5, paper_trade=False):
-    """
-    Executes all strategy scans using official live NSE website data.
-    Auto-closes open INTRADAY trades if scanning after market hours.
-    """
-    # Auto-close open intraday trades after market hours
-    self.close_expired_intraday_trades()
+        if tickers is None:
+            tickers = self.fetch_nse_universe("NIFTY 50")
 
-    if tickers is None:
-        tickers = self.fetch_nse_universe("NIFTY 500")
+        status = self.risk_status()
+        open_slots = max(0, self.risk.max_open_positions - status["open_positions"]) if paper_trade else None
 
-    status = self.risk_status()
-    open_slots = max(0, self.risk.max_open_positions - status["open_positions"]) if paper_trade else None
-    
-    nse_client = NSELiveClient()
-    swing_list, intraday_list, btst_list = [], [], []
+        swing_list, intraday_list, btst_list = [], [], []
 
-    for ticker in tickers:
-        try:
-            # Fetch data directly from official NSE endpoints
-            df = nse_client.fetch_stock_history(ticker)
-            
-            if len(df) < 50:
+        for ticker in tickers:
+            try:
+                df = self.nse_client.fetch_stock_history(ticker)
+                
+                if len(df) < 50:
+                    continue
+
+                close = df['Close']
+                high = df['High']
+                low = df['Low']
+                volume = df['Volume']
+
+                # Technical Indicators
+                ema20 = ta.trend.ema_indicator(close, window=20)
+                ema50 = ta.trend.ema_indicator(close, window=50)
+                ema200 = ta.trend.ema_indicator(close, window=200)
+                rsi = ta.momentum.rsi(close, window=14)
+                atr = ta.volatility.average_true_range(high, low, close, window=14)
+                vol_sma20 = volume.rolling(20).mean()
+                high_20 = high.rolling(20).max()
+
+                curr_close, prev_close = float(close.iloc[-1]), float(close.iloc[-2])
+                curr_high, curr_low = float(high.iloc[-1]), float(low.iloc[-1])
+                curr_vol, curr_vol_sma = float(volume.iloc[-1]), float(vol_sma20.iloc[-1])
+                curr_rsi, curr_atr = float(rsi.iloc[-1]), float(atr.iloc[-1])
+                curr_ema20, curr_ema50, curr_ema200 = float(ema20.iloc[-1]), float(ema50.iloc[-1]), float(ema200.iloc[-1])
+                prev_high20 = float(high_20.iloc[-2])
+
+                if (curr_close * curr_vol_sma) < 5_000_000:
+                    continue
+
+                clean_symbol = ticker.replace(".NS", "")
+                vol_mult = round(curr_vol / curr_vol_sma, 2) if curr_vol_sma > 0 else 1.0
+
+                # 1. SWING STRATEGY
+                if (curr_ema20 > curr_ema50) and (curr_close > curr_ema200) and (53 <= curr_rsi <= 72) and (vol_mult >= 1.2) and (curr_close >= prev_high20 * 0.99):
+                    sl = curr_close - (1.5 * curr_atr)
+                    tgt = curr_close + (2.5 * curr_atr)
+                    
+                    if self.risk.passes_reward_risk(curr_close, sl, tgt):
+                        pos = self.risk.position_size(curr_close, sl)
+                        qty = pos.qty if status["new_entries_allowed"] else 0
+                        
+                        traded = self._maybe_open_stock(paper_trade, "SWING", clean_symbol, curr_close, sl, tgt, qty, pos.risk_amount, pos.position_value, status, open_slots)
+                        if traded and open_slots is not None:
+                            open_slots -= 1
+
+                        swing_list.append({
+                            "Ticker": clean_symbol,
+                            "Price": round(curr_close, 2),
+                            "RSI": round(curr_rsi, 1),
+                            "Vol_Mult": vol_mult,
+                            "StopLoss": round(sl, 2),
+                            "Target": round(tgt, 2),
+                            "Qty": qty,
+                            "Risk_Amt": pos.risk_amount,
+                            "Position_Val": pos.position_value,
+                            **({"Traded": traded} if paper_trade else {})
+                        })
+
+                # 2. INTRADAY STRATEGY
+                if (curr_close > curr_ema20) and (curr_rsi >= 56) and (vol_mult >= 1.5):
+                    sl = curr_close - (1.0 * curr_atr)
+                    tgt = curr_close + (1.8 * curr_atr)
+                    
+                    if self.risk.passes_reward_risk(curr_close, sl, tgt):
+                        pos = self.risk.position_size(curr_close, sl)
+                        qty = pos.qty if status["new_entries_allowed"] else 0
+                        
+                        traded = self._maybe_open_stock(paper_trade, "INTRADAY", clean_symbol, curr_close, sl, tgt, qty, pos.risk_amount, pos.position_value, status, open_slots)
+                        if traded and open_slots is not None:
+                            open_slots -= 1
+
+                        intraday_list.append({
+                            "Ticker": clean_symbol,
+                            "Price": round(curr_close, 2),
+                            "RSI": round(curr_rsi, 1),
+                            "Vol_Mult": vol_mult,
+                            "StopLoss": round(sl, 2),
+                            "Target": round(tgt, 2),
+                            "Qty": qty,
+                            "Risk_Amt": pos.risk_amount,
+                            "Position_Val": pos.position_value,
+                            **({"Traded": traded} if paper_trade else {})
+                        })
+
+                # 3. BTST STRATEGY
+                day_range = curr_high - curr_low
+                close_loc = (curr_close - curr_low) / day_range if day_range > 0 else 0
+
+                if (close_loc >= 0.80) and (58 <= curr_rsi <= 75) and (vol_mult >= 1.5) and (curr_close > prev_close):
+                    sl = curr_close - (1.3 * curr_atr)
+                    tgt = curr_close + (2.0 * curr_atr)
+                    
+                    if self.risk.passes_reward_risk(curr_close, sl, tgt):
+                        pos = self.risk.position_size(curr_close, sl)
+                        qty = pos.qty if status["new_entries_allowed"] else 0
+                        
+                        traded = self._maybe_open_stock(paper_trade, "BTST", clean_symbol, curr_close, sl, tgt, qty, pos.risk_amount, pos.position_value, status, open_slots)
+                        if traded and open_slots is not None:
+                            open_slots -= 1
+
+                        btst_list.append({
+                            "Ticker": clean_symbol,
+                            "Price": round(curr_close, 2),
+                            "Close_High_%": round(close_loc * 100, 1),
+                            "RSI": round(curr_rsi, 1),
+                            "Vol_Mult": vol_mult,
+                            "StopLoss": round(sl, 2),
+                            "Target": round(tgt, 2),
+                            "Qty": qty,
+                            "Risk_Amt": pos.risk_amount,
+                            "Position_Val": pos.position_value,
+                            **({"Traded": traded} if paper_trade else {})
+                        })
+
+                time.sleep(0.1)
+
+            except Exception:
                 continue
 
-            close = df['Close']
-            high = df['High']
-            low = df['Low']
-            volume = df['Volume']
-
-            # Indicators
-            ema20 = ta.trend.ema_indicator(close, window=20)
-            ema50 = ta.trend.ema_indicator(close, window=50)
-            ema200 = ta.trend.ema_indicator(close, window=200)
-            rsi = ta.momentum.rsi(close, window=14)
-            atr = ta.volatility.average_true_range(high, low, close, window=14)
-            vol_sma20 = volume.rolling(20).mean()
-            high_20 = high.rolling(20).max()
-
-            curr_close, prev_close = float(close.iloc[-1]), float(close.iloc[-2])
-            curr_high, curr_low = float(high.iloc[-1]), float(low.iloc[-1])
-            curr_vol, curr_vol_sma = float(volume.iloc[-1]), float(vol_sma20.iloc[-1])
-            curr_rsi, curr_atr = float(rsi.iloc[-1]), float(atr.iloc[-1])
-            curr_ema20, curr_ema50, curr_ema200 = float(ema20.iloc[-1]), float(ema50.iloc[-1]), float(ema200.iloc[-1])
-            prev_high20 = float(high_20.iloc[-2])
-
-            if (curr_close * curr_vol_sma) < 5_000_000:
-                continue
-
-            clean_symbol = ticker.replace(".NS", "")
-            vol_mult = round(curr_vol / curr_vol_sma, 2) if curr_vol_sma > 0 else 1.0
-
-            # 1. SWING STRATEGY
-            if (curr_ema20 > curr_ema50) and (curr_close > curr_ema200) and (53 <= curr_rsi <= 72) and (vol_mult >= 1.2) and (curr_close >= prev_high20 * 0.99):
-                sl = curr_close - (1.5 * curr_atr)
-                tgt = curr_close + (2.5 * curr_atr)
-                
-                if self.risk.passes_reward_risk(curr_close, sl, tgt):
-                    pos = self.risk.position_size(curr_close, sl)
-                    qty = pos.qty if status["new_entries_allowed"] else 0
-                    
-                    traded = self._maybe_open_stock(paper_trade, "SWING", clean_symbol, curr_close, sl, tgt, qty, pos.risk_amount, pos.position_value, status, open_slots)
-                    if traded and open_slots is not None:
-                        open_slots -= 1
-
-                    swing_list.append({
-                        "Ticker": clean_symbol,
-                        "Price": round(curr_close, 2),
-                        "RSI": round(curr_rsi, 1),
-                        "Vol_Mult": vol_mult,
-                        "StopLoss": round(sl, 2),
-                        "Target": round(tgt, 2),
-                        "Qty": qty,
-                        "Risk_Amt": pos.risk_amount,
-                        "Position_Val": pos.position_value,
-                        **({"Traded": traded} if paper_trade else {})
-                    })
-
-            # 2. INTRADAY STRATEGY
-            if (curr_close > curr_ema20) and (curr_rsi >= 56) and (vol_mult >= 1.5):
-                sl = curr_close - (1.0 * curr_atr)
-                tgt = curr_close + (1.8 * curr_atr)
-                
-                if self.risk.passes_reward_risk(curr_close, sl, tgt):
-                    pos = self.risk.position_size(curr_close, sl)
-                    qty = pos.qty if status["new_entries_allowed"] else 0
-                    
-                    traded = self._maybe_open_stock(paper_trade, "INTRADAY", clean_symbol, curr_close, sl, tgt, qty, pos.risk_amount, pos.position_value, status, open_slots)
-                    if traded and open_slots is not None:
-                        open_slots -= 1
-
-                    intraday_list.append({
-                        "Ticker": clean_symbol,
-                        "Price": round(curr_close, 2),
-                        "RSI": round(curr_rsi, 1),
-                        "Vol_Mult": vol_mult,
-                        "StopLoss": round(sl, 2),
-                        "Target": round(tgt, 2),
-                        "Qty": qty,
-                        "Risk_Amt": pos.risk_amount,
-                        "Position_Val": pos.position_value,
-                        **({"Traded": traded} if paper_trade else {})
-                    })
-
-            # 3. BTST STRATEGY
-            day_range = curr_high - curr_low
-            close_loc = (curr_close - curr_low) / day_range if day_range > 0 else 0
-
-            if (close_loc >= 0.80) and (58 <= curr_rsi <= 75) and (vol_mult >= 1.5) and (curr_close > prev_close):
-                sl = curr_close - (1.3 * curr_atr)
-                tgt = curr_close + (2.0 * curr_atr)
-                
-                if self.risk.passes_reward_risk(curr_close, sl, tgt):
-                    pos = self.risk.position_size(curr_close, sl)
-                    qty = pos.qty if status["new_entries_allowed"] else 0
-                    
-                    traded = self._maybe_open_stock(paper_trade, "BTST", clean_symbol, curr_close, sl, tgt, qty, pos.risk_amount, pos.position_value, status, open_slots)
-                    if traded and open_slots is not None:
-                        open_slots -= 1
-
-                    btst_list.append({
-                        "Ticker": clean_symbol,
-                        "Price": round(curr_close, 2),
-                        "Close_High_%": round(close_loc * 100, 1),
-                        "RSI": round(curr_rsi, 1),
-                        "Vol_Mult": vol_mult,
-                        "StopLoss": round(sl, 2),
-                        "Target": round(tgt, 2),
-                        "Qty": qty,
-                        "Risk_Amt": pos.risk_amount,
-                        "Position_Val": pos.position_value,
-                        **({"Traded": traded} if paper_trade else {})
-                    })
-
-            time.sleep(0.1)
-
-        except Exception:
-            continue
-
-    return {
-        "SWING": pd.DataFrame(swing_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if swing_list else pd.DataFrame(),
-        "INTRADAY": pd.DataFrame(intraday_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if intraday_list else pd.DataFrame(),
-        "BTST": pd.DataFrame(btst_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if btst_list else pd.DataFrame()
-    }
+        return {
+            "SWING": pd.DataFrame(swing_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if swing_list else pd.DataFrame(),
+            "INTRADAY": pd.DataFrame(intraday_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if intraday_list else pd.DataFrame(),
+            "BTST": pd.DataFrame(btst_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if btst_list else pd.DataFrame()
+        }
