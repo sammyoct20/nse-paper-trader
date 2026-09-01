@@ -8,11 +8,10 @@ from datetime import datetime
 
 log = logging.getLogger("unified_engine")
 
-
 class NSELiveClient:
     """
-    Direct client that fetches live quotes and historical daily candle data
-    directly from official NSE India backend endpoints.
+    Direct client that fetches live quotes and 1-year historical daily candles 
+    from official NSE India endpoints.
     """
     BASE_URL = "https://www.nseindia.com"
     QUOTE_URL = "https://www.nseindia.com/api/quote-equity?symbol="
@@ -71,44 +70,79 @@ class NSELiveClient:
             return pd.DataFrame()
 
 
-class DummyRiskManager:
-    """Fallback Risk Manager if internal risk module is not imported."""
-    def __init__(self):
-        self.max_open_positions = 5
+class PositionSizeResult:
+    def __init__(self, qty, risk_amount, position_value):
+        self.qty = qty
+        self.risk_amount = risk_amount
+        self.position_value = position_value
+
+
+class RiskManager:
+    """
+    Manages risk allocation parameters consumed by app.py.
+    """
+    def __init__(self, capital=100000.0, risk_per_trade_pct=1.0, max_open_positions=5, min_rr_ratio=1.5):
+        self.capital = capital
+        self.risk_per_trade_pct = risk_per_trade_pct
+        self.max_open_positions = max_open_positions
+        self.min_rr_ratio = min_rr_ratio
 
     def passes_reward_risk(self, entry, sl, tgt):
-        return (tgt - entry) >= (entry - sl)
+        risk = abs(entry - sl)
+        reward = abs(tgt - entry)
+        if risk <= 0:
+            return False
+        return (reward / risk) >= self.min_rr_ratio
 
     def position_size(self, entry, sl):
-        class Position:
-            qty = 10
-            risk_amount = round((entry - sl) * 10, 2)
-            position_value = round(entry * 10, 2)
-        return Position()
+        risk_per_share = abs(entry - sl)
+        if risk_per_share <= 0:
+            return PositionSizeResult(0, 0.0, 0.0)
+
+        risk_amount = self.capital * (self.risk_per_trade_pct / 100.0)
+        qty = int(risk_amount // risk_per_share)
+        
+        # Capital cap per trade check (e.g., max 20% capital in single stock)
+        max_position_val = self.capital * 0.20
+        if (qty * entry) > max_position_val:
+            qty = int(max_position_val // entry)
+
+        position_value = round(qty * entry, 2)
+        actual_risk = round(qty * risk_per_share, 2)
+
+        return PositionSizeResult(qty, actual_risk, position_value)
 
 
 class PaperEngine:
     """
     Core Trading Engine consumed by Streamlit app.py
     """
-    def __init__(self, risk_manager=None):
-        self.risk = risk_manager if risk_manager else DummyRiskManager()
+    def __init__(self, capital=100000.0, risk_per_trade_pct=1.0, max_open_positions=5):
+        self.risk = RiskManager(
+            capital=capital,
+            risk_per_trade_pct=risk_per_trade_pct,
+            max_open_positions=max_open_positions
+        )
         self.open_positions = []
         self.nse_client = NSELiveClient()
 
     def risk_status(self):
-        """Returns risk and position allocation metrics."""
+        """Returns risk and position allocation metrics expected by app.py."""
         return {
+            "capital": self.risk.capital,
+            "risk_per_trade_pct": self.risk.risk_per_trade_pct,
+            "risk_per_trade_amount": self.risk.capital * (self.risk.risk_per_trade_pct / 100.0),
+            "max_open_positions": self.risk.max_open_positions,
             "open_positions": len(self.open_positions),
             "new_entries_allowed": len(self.open_positions) < self.risk.max_open_positions
         }
 
     def fetch_nse_universe(self, index_name="NIFTY 50"):
-        """Returns default stock universe list."""
+        """Default universe listing."""
         return ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC"]
 
     def _maybe_open_stock(self, paper_trade, strategy, symbol, close, sl, tgt, qty, risk_amt, pos_val, status, open_slots):
-        """Simulates opening a paper position if enabled."""
+        """Simulates paper trading order entry."""
         if paper_trade and open_slots is not None and open_slots > 0:
             trade = {
                 "strategy": strategy,
@@ -127,14 +161,14 @@ class PaperEngine:
         return False
 
     def _close_position(self, trade, exit_price, reason="EOD Market Close"):
-        """Closes a position and removes it from active open positions."""
+        """Removes an active position on exit trigger."""
         if trade in self.open_positions:
             self.open_positions.remove(trade)
             log.info(f"Position closed for {trade['symbol']} | Reason: {reason} | Exit Price: {exit_price}")
 
     def close_expired_intraday_trades(self):
         """
-        Force-closes all open INTRADAY paper trades if market hours are over (>= 15:15 IST).
+        Auto-closes open INTRADAY paper positions if current time is past 15:15 IST.
         """
         now = datetime.now()
         if now.hour > 15 or (now.hour == 15 and now.minute >= 15):
@@ -145,8 +179,7 @@ class PaperEngine:
 
     def scan_all_strategies(self, tickers=None, top_n=5, paper_trade=False):
         """
-        Executes SWING, INTRADAY, and BTST strategy scans using official live NSE website data.
-        Auto-closes open INTRADAY trades if executed past market hours.
+        Executes strategy scans using official live NSE website data.
         """
         self.close_expired_intraday_trades()
 
