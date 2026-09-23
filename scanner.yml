@@ -1,7 +1,5 @@
 name: NSE paper scanner
 on:
-  schedule:
-    - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch:
 jobs:
   scan:
