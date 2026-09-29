@@ -1,6 +1,15 @@
+import importlib
+import inspect
 import streamlit as st
 import pandas as pd
-from engine import PaperEngine
+import engine as engine_module
+
+# Streamlit keeps imported modules cached in the running server, so a redeploy
+# or file change can leave an OLD engine module in memory. If the class is
+# missing the index analyzer, force-reload the module from disk once.
+if not hasattr(engine_module.PaperEngine, "analyze_index"):
+    engine_module = importlib.reload(engine_module)
+PaperEngine = engine_module.PaperEngine
 
 st.set_page_config(page_title="NSE Stock & Index Options Scanner Engine", layout="wide")
 st.title("⚡ Sammy - Multi-Asset Trading Engine")
@@ -11,11 +20,30 @@ if "engine" not in st.session_state or not hasattr(st.session_state.engine, "ana
     st.session_state.engine = PaperEngine()
 
 if not hasattr(st.session_state.engine, "analyze_index"):
-    st.error(
-        "The deployed engine.py is out of date (it has no index analyzer). "
-        "Upload the new engine.py to GitHub, then reboot the app from Streamlit's "
-        "Manage app menu."
-    )
+    _path = inspect.getsourcefile(engine_module) or "unknown"
+    _lines = []
+    try:
+        with open(_path, encoding="utf-8") as _f:
+            _lines = _f.read().splitlines()
+    except Exception:
+        pass
+    _hits = [(i + 1, l) for i, l in enumerate(_lines) if "def analyze_index" in l]
+    if not _hits:
+        _why = ("The engine.py this server is running does NOT contain `def analyze_index`. "
+                "The server is running a different / older copy — check the file path below "
+                "and that the app is deployed from the branch you pushed to, then reboot.")
+    else:
+        _indent = len(_hits[0][1]) - len(_hits[0][1].lstrip())
+        if _indent == 0 or hasattr(engine_module, "analyze_index"):
+            _why = ("`def analyze_index` is in engine.py but NOT indented inside `class PaperEngine` "
+                    "(it must be indented 4 spaces, at the same level as `def analyze_stock`).")
+        else:
+            _why = ("`def analyze_index` is in the file but the class doesn't expose it — "
+                    "reboot the app so the server reloads engine.py.")
+    st.error("Engine mismatch: " + _why)
+    st.code(f"engine file: {_path}\nanalyze_index found at line(s): {[n for n, _ in _hits]}\n"
+            f"indent of first match: {(len(_hits[0][1]) - len(_hits[0][1].lstrip())) if _hits else 'n/a'} spaces\n"
+            f"lines in file: {len(_lines)} (expected ~1725 for the new version)")
     st.stop()
 
 @st.cache_data(ttl=900)
