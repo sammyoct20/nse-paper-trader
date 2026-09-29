@@ -81,40 +81,85 @@ with tab3:
         st.info("Click 'Run Equity Market Scan' to fetch setups.")
 
 with tab4:
-    st.subheader("Single Stock Technical Diagnostic")
-    symbol_input = st.text_input("Enter NSE Ticker Symbol:", "RELIANCE")
-    if st.button("Analyze Stock"):
-        with st.spinner(f"Analyzing {symbol_input}..."):
-            res = st.session_state.engine.analyze_stock(symbol_input)
-            if "Error" in res:
-                st.error(res["Error"])
+    st.subheader("Stock & Index Technical Diagnostic")
+    st.caption("Enter an NSE stock symbol (e.g. RELIANCE), or NIFTY / SENSEX / BANKNIFTY for an index up/down read.")
+
+    qcol1, qcol2, qcol3 = st.columns(3)
+    quick = None
+    if qcol1.button("📈 Analyze NIFTY"):
+        quick = "NIFTY"
+    if qcol2.button("📈 Analyze SENSEX"):
+        quick = "SENSEX"
+    if qcol3.button("📈 Analyze BANKNIFTY"):
+        quick = "BANKNIFTY"
+
+    symbol_input = st.text_input("Enter NSE Ticker Symbol or Index:", "RELIANCE")
+    run_symbol = quick or (symbol_input if st.button("Analyze") else None)
+
+    if run_symbol:
+        with st.spinner(f"Analyzing {run_symbol}..."):
+            res = st.session_state.engine.analyze_stock(run_symbol)
+        if "Error" in res:
+            st.error(res["Error"])
+        elif res.get("Is_Index"):
+            bias = res["Bias"]
+            if bias == "UP":
+                st.success(f"{res['Symbol']}: bias is UP ({res['Bias_Score']}) — {res['Trend_Strength']}")
+            elif bias == "DOWN":
+                st.error(f"{res['Symbol']}: bias is DOWN ({res['Bias_Score']}) — {res['Trend_Strength']}")
             else:
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Price", f"₹{res['Price']}")
-                c2.metric("Technical Score", res['Score'])
-                c3.metric("RSI (14)", res['RSI'])
-                c4.metric("Stop Loss", f"₹{res['StopLoss']}")
-                c5.metric("Target", f"₹{res['Target']}")
+                st.warning(f"{res['Symbol']}: SIDEWAYS / MIXED ({res['Bias_Score']}) — {res['Trend_Strength']}")
 
-                c6, c7, c8 = st.columns(3)
-                c6.metric("Kotegawa-Sized Qty", res['Qty'])
-                c7.metric("Risk Amount", f"₹{res['RiskAmount']}")
-                c8.metric("Position Value", f"₹{res['PositionValue']}")
-                if res['Qty'] == 0:
-                    st.caption("Qty is 0 because the risk gate is currently closed (circuit breaker tripped or max open positions reached) — see the sidebar.")
+            i1, i2, i3, i4, i5 = st.columns(5)
+            i1.metric("Level", f"{res['Price']:,.2f}", f"{res['Day_Change_%']:+.2f}%")
+            i2.metric("RSI (14, daily)", res["RSI"])
+            i3.metric("ADX (14, daily)", res["ADX"])
+            i4.metric("ATR (14, daily)", res["ATR"])
+            i5.metric("200-day EMA", f"{res['EMA200']:,.2f}")
+            st.caption(f"Session analysed: {res['Session']} (latest available 5-min data; may lag the live tape).")
 
-                st.markdown("### Technical Setup Checklist")
-                for item in res["Checklist"]:
-                    if item.startswith("✓"):
-                        st.success(item)
-                    else:
-                        st.error(item)
+            st.markdown("### Trend Factors")
+            for item in res["Checklist"]:
+                if item.startswith("✓"):
+                    st.success(item)
+                elif item.startswith("✗"):
+                    st.error(item)
+                else:
+                    st.info(item)
+
+            st.markdown("### Key Levels")
+            st.dataframe(
+                pd.DataFrame(list(res["Levels"].items()), columns=["Level", "Value"]),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption("A read of current conditions from price data — not a forecast. Yahoo provides no volume for indices, so volume is not used.")
+        else:
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Price", f"₹{res['Price']}")
+            c2.metric("Technical Score", res['Score'])
+            c3.metric("RSI (14)", res['RSI'])
+            c4.metric("Stop Loss", f"₹{res['StopLoss']}")
+            c5.metric("Target", f"₹{res['Target']}")
+
+            c6, c7, c8 = st.columns(3)
+            c6.metric("Kotegawa-Sized Qty", res['Qty'])
+            c7.metric("Risk Amount", f"₹{res['RiskAmount']}")
+            c8.metric("Position Value", f"₹{res['PositionValue']}")
+            if res['Qty'] == 0:
+                st.caption("Qty is 0 because the risk gate is currently closed (circuit breaker tripped or max open positions reached) — see the sidebar.")
+
+            st.markdown("### Technical Setup Checklist")
+            for item in res["Checklist"]:
+                if item.startswith("✓"):
+                    st.success(item)
+                else:
+                    st.error(item)
 
 with tab5:
     st.subheader("NIFTY (Tuesday Expiry) & SENSEX (Thursday Expiry) Signals")
     col1, col2 = st.columns(2)
     with col1:
-        st.caption("Strategy: 5-Min Trend + RSI Momentum Breakout (CE/PE)")
+        st.caption("Strategy: 5-Min Trend + 12-candle Breakout + ADX/15m filters (CE/PE). Expiry day: entries stop 13:30, half size.")
     with col2:
         st.caption("Lot Sizes: NIFTY = 65 | SENSEX = 20")
 
@@ -129,7 +174,7 @@ with tab5:
                     st.success(f"Trade Execution Contract: {signal['Contract Symbol']}")
                 st.json(signal)
             else:
-                st.warning(f"No clear CE/PE directional breakout detected for {idx_select} right now.")
+                st.warning(f"No CE/PE setup for {idx_select} right now (no qualifying breakout, or outside the entry window).")
 
 with tab6:
     st.subheader("Paper Trading Account")
