@@ -5,8 +5,18 @@ from engine import PaperEngine
 st.set_page_config(page_title="NSE Stock & Index Options Scanner Engine", layout="wide")
 st.title("⚡ Sammy - Multi-Asset Trading Engine")
 
-if "engine" not in st.session_state:
+# Rebuild the cached engine if this browser session is holding an object from an
+# older deploy (session_state survives code updates until the server restarts).
+if "engine" not in st.session_state or not hasattr(st.session_state.engine, "analyze_index"):
     st.session_state.engine = PaperEngine()
+
+if not hasattr(st.session_state.engine, "analyze_index"):
+    st.error(
+        "The deployed engine.py is out of date (it has no index analyzer). "
+        "Upload the new engine.py to GitHub, then reboot the app from Streamlit's "
+        "Manage app menu."
+    )
+    st.stop()
 
 @st.cache_data(ttl=900)
 def fetch_scan_results(index_name, top_n):
@@ -94,7 +104,8 @@ with tab4:
         quick = "BANKNIFTY"
 
     symbol_input = st.text_input("Enter NSE Ticker Symbol or Index:", "RELIANCE")
-    run_symbol = quick or (symbol_input if st.button("Analyze") else None)
+    analyze_clicked = st.button("🔍 Analyze Stock / Index")  # always rendered, never short-circuited
+    run_symbol = quick or (symbol_input if analyze_clicked else None)
 
     if run_symbol:
         with st.spinner(f"Analyzing {run_symbol}..."):
