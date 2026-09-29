@@ -458,6 +458,133 @@ INDEX_ALIASES = {
 ANALYZER_INDEX_TICKERS = {"NIFTY": "^NSEI", "SENSEX": "^BSESN", "BANKNIFTY": "^NSEBANK"}
 
 
+def historical_edge(d: pd.DataFrame, name: str, horizons=(1, 3, 5),
+                    min_cases: int = 30, min_episodes: int = 15) -> dict | None:
+    """Base rates from the index's own history. Answers: "on days that looked
+    like today (same daily bias bucket, and the same RSI zone), what happened
+    over the next 1 / 3 / 5 trading days — and how does that compare with ALL
+    days?" The all-days baseline is the honest yardstick: most indices rise on
+    ~52-55% of days regardless, so a 55% "up" rate after some pattern is no edge.
+
+    Safeguards against fooling yourself:
+      - forward returns look only forward (shift(-h)); no look-ahead
+      - overlapping cases are clustered, so we report separate EPISODES too
+      - a percentage is only trusted with >= min_cases and >= min_episodes
+      - the pattern must lean the same way in the earlier AND the recent half
+        of history, otherwise it's flagged as unstable
+    Uses daily factors only (the intraday factors have no long history)."""
+    d = d.dropna(subset=["Close"])
+    if len(d) < 400:
+        return None
+    close = d["Close"].astype(float)
+    ema20 = ta.trend.ema_indicator(close, window=20)
+    ema50 = ta.trend.ema_indicator(close, window=50)
+    ema200 = ta.trend.ema_indicator(close, window=200)
+    rsi = ta.momentum.rsi(close, window=14)
+    ret = close.pct_change() * 100
+
+    raw = (np.where(close > ema200, 1, -1) + np.where(ema20 > ema50, 1, -1)
+           + np.where(close > ema20, 1, -1)
+           + np.where(rsi > 55, 1, np.where(rsi < 45, -1, 0))
+           + np.where(ret > 0.15, 1, np.where(ret < -0.15, -1, 0)))
+    valid = (ema200.notna() & rsi.notna() & ret.notna()).to_numpy()
+    score = pd.Series(raw, index=close.index).where(valid)
+    bucket = pd.Series(np.where(score >= 3, "UP", np.where(score <= -3, "DOWN", "MIXED")),
+                       index=close.index).where(valid)
+    zone = pd.cut(rsi, [-np.inf, 30, 45, 55, 70, np.inf],
+                  labels=["oversold (<30)", "weak (30-45)", "neutral (45-55)",
+                          "strong (55-70)", "overbought (>70)"]).astype(object)
+    zone = pd.Series(zone, index=close.index)
+
+    if pd.isna(score.iloc[-1]) or pd.isna(zone.iloc[-1]):
+        return None
+    b_now, z_now = str(bucket.iloc[-1]), str(zone.iloc[-1])
+    vmask = pd.Series(valid, index=close.index)
+    split = close.index[vmask.to_numpy()][int(vmask.sum() // 2)]
+
+    def stats(fwd, m, baseline=False):
+        m = m & fwd.notna()
+        x = fwd[m]
+        n = int(len(x))
+        if n == 0:
+            return {"n": 0, "episodes": 0, "ok": False}
+        pos = np.flatnonzero(m.to_numpy())
+        episodes = 1 + int((np.diff(pos) > 5).sum())
+        first, second = x[x.index < split], x[x.index >= split]
+        return {
+            "n": n, "episodes": episodes,
+            "ok": n >= min_cases and (baseline or episodes >= min_episodes),
+            "pct_up": float((x > 0).mean() * 100), "pct_down": float((x < 0).mean() * 100),
+            "avg": float(x.mean()), "median": float(x.median()),
+            "p10": float(x.quantile(0.10)), "p90": float(x.quantile(0.90)),
+            "up_first": float((first > 0).mean() * 100) if len(first) >= 10 else None,
+            "up_second": float((second > 0).mean() * 100) if len(second) >= 10 else None,
+        }
+
+    table, by_h = [], {}
+    for h in horizons:
+        fwd = (close.shift(-h) / close - 1) * 100
+        sets = [
+            ("All days (baseline)", vmask),
+            (f"Same bias ({b_now})", vmask & (bucket == b_now)),
+            (f"Bias {b_now} + RSI {z_now}", vmask & (bucket == b_now) & (zone == z_now)),
+        ]
+        by_h[h] = [(label, stats(fwd, m, baseline=(i == 0))) for i, (label, m) in enumerate(sets)]
+        for label, st_ in by_h[h]:
+            if st_["n"] == 0:
+                continue
+            reliable = st_["ok"]
+            table.append({
+                "Horizon": f"{h}d", "Situation": label, "Cases": st_["n"], "Episodes": (st_["episodes"] if label != "All days (baseline)" else None),
+                "% Up": round(st_["pct_up"], 1) if reliable else None,
+                "% Down": round(st_["pct_down"], 1) if reliable else None,
+                "Avg move %": round(st_["avg"], 2) if reliable else None,
+                "Median %": round(st_["median"], 2) if reliable else None,
+                "10th pct %": round(st_["p10"], 2) if reliable else None,
+                "90th pct %": round(st_["p90"], 2) if reliable else None,
+                "Reliable": "yes" if reliable else "too few cases",
+            })
+
+    # ---- plain-English verdict on the 3-day horizon
+    base_label, base = by_h[3][0]
+    verdict = None
+    for label, st_ in (by_h[3][2], by_h[3][1]):        # narrowest reliable set first
+        if not st_["ok"]:
+            continue
+        diff = st_["pct_up"] - base["pct_up"]
+        halves = [st_["up_first"], st_["up_second"]]
+        p0 = min(max(base["pct_up"] / 100, 0.05), 0.95)
+        z = abs(diff / 100) / ((p0 * (1 - p0) / max(st_["episodes"], 1)) ** 0.5)
+        significant = z >= 2.0
+        stable = (None not in halves) and all((hv - base["pct_up"]) * diff > 0 and abs(hv - base["pct_up"]) >= 2 for hv in halves)
+        head = (f"In {st_['n']} past days matching \"{label}\" ({st_['episodes']} separate episodes), "
+                f"{name} was higher 3 trading days later {st_['pct_up']:.0f}% of the time "
+                f"(lower {st_['pct_down']:.0f}%), versus {base['pct_up']:.0f}% up across all days. "
+                f"Typical outcomes ranged {st_['p10']:+.1f}% to {st_['p90']:+.1f}%.")
+        if abs(diff) >= 5 and significant and stable:
+            verdict = (head + f" That's a {abs(diff):.0f}-point lean toward {'UP' if diff > 0 else 'DOWN'} moves, "
+                       "and it held in both the earlier and recent halves of history. A tendency, not a forecast.")
+            strength = "lean"
+        elif abs(diff) >= 5:
+            verdict = (head + f" There is a {abs(diff):.0f}-point difference, but it is not statistically solid "
+                       "and/or did not hold in both halves of history, so treat it as unreliable.")
+            strength = "unstable"
+        else:
+            verdict = head + " That is within normal noise of the baseline — no reliable edge from this pattern."
+            strength = "none"
+        break
+    if verdict is None:
+        verdict = ("Too few similar past cases for a reliable percentage. Treat the bias as a description "
+                   "of current conditions only.")
+        strength = "insufficient"
+
+    return {
+        "state": {"daily_score": int(score.iloc[-1]), "bucket": b_now, "rsi_zone": z_now},
+        "table": table, "verdict": verdict, "strength": strength,
+        "years": round(len(d) / 252, 1), "since": str(close.index[0].date()),
+    }
+
+
 # -------------------------------------------------------------------
 # SCHEMA — single source of truth. ensure_schema() creates each table with
 # just an id, then runs every (column, postgres_type, sqlite_type) tuple
@@ -1520,7 +1647,7 @@ class PaperEngine:
         Keeps every key analyze_stock() returns so the UI doesn't break."""
         yf_symbol = ANALYZER_INDEX_TICKERS[name]
         try:
-            d = yf.Ticker(yf_symbol).history(period="1y", interval="1d")
+            d = yf.Ticker(yf_symbol).history(period="15y", interval="1d")  # long history for base rates
             m = yf.Ticker(yf_symbol).history(period="5d", interval="5m")
         except Exception as e:
             return {"Error": f"Could not fetch {name} data: {e}"}
@@ -1574,11 +1701,36 @@ class PaperEngine:
         checklist = [f"{'✓' if s > 0 else ('✗' if s < 0 else '•')} {label}" for label, s in factors]
         checklist.append(f"• ADX {c_adx:.1f} ({strength})")
 
+        # ---- stretch / exhaustion warnings (a low RSI counts as bearish above, but
+        # deeply oversold markets bounce often, so flag it explicitly)
+        warnings_list = []
+        dist200 = (c_px / c200 - 1) * 100
+        if c_rsi < 30:
+            warnings_list.append(f"Daily RSI {c_rsi:.1f} is OVERSOLD — after sharp falls, relief bounces are common; the bearish read may be stretched.")
+        elif c_rsi > 70:
+            warnings_list.append(f"Daily RSI {c_rsi:.1f} is OVERBOUGHT — pullbacks are common after sharp rallies; the bullish read may be stretched.")
+        if abs(dist200) >= 5:
+            warnings_list.append(f"Price is {dist200:+.1f}% from its 200-day EMA — an extended move; late entries carry reversal risk.")
+        bias_note = bias
+        if bias == "DOWN" and c_rsi < 30:
+            bias_note = "DOWN (but oversold — bounce risk)"
+        elif bias == "UP" and c_rsi > 70:
+            bias_note = "UP (but overbought — pullback risk)"
+
+        try:
+            history = historical_edge(d, name)
+        except Exception as e:
+            log.warning(f"historical_edge failed for {name}: {e}")
+            history = None
+
         return {
             "Symbol": name,
             "Is_Index": True,
             "Price": round(price, 2),
             "Bias": bias,
+            "Bias_Note": bias_note,
+            "Warnings": warnings_list,
+            "History": history,
             "Bias_Score": f"{total:+d} / {len(factors)}",
             "Trend_Strength": strength,
             "Day_Change_%": round(day_chg, 2),

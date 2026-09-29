@@ -43,7 +43,7 @@ if not hasattr(st.session_state.engine, "analyze_index"):
     st.error("Engine mismatch: " + _why)
     st.code(f"engine file: {_path}\nanalyze_index found at line(s): {[n for n, _ in _hits]}\n"
             f"indent of first match: {(len(_hits[0][1]) - len(_hits[0][1].lstrip())) if _hits else 'n/a'} spaces\n"
-            f"lines in file: {len(_lines)} (expected ~1725 for the new version)")
+            f"lines in file: {len(_lines)} (expected ~1877 for the new version)")
     st.stop()
 
 @st.cache_data(ttl=900)
@@ -142,12 +142,15 @@ with tab4:
             st.error(res["Error"])
         elif res.get("Is_Index"):
             bias = res["Bias"]
+            note = res.get("Bias_Note", bias)
             if bias == "UP":
-                st.success(f"{res['Symbol']}: bias is UP ({res['Bias_Score']}) — {res['Trend_Strength']}")
+                st.success(f"{res['Symbol']}: bias is {note} ({res['Bias_Score']}) — {res['Trend_Strength']}")
             elif bias == "DOWN":
-                st.error(f"{res['Symbol']}: bias is DOWN ({res['Bias_Score']}) — {res['Trend_Strength']}")
+                st.error(f"{res['Symbol']}: bias is {note} ({res['Bias_Score']}) — {res['Trend_Strength']}")
             else:
                 st.warning(f"{res['Symbol']}: SIDEWAYS / MIXED ({res['Bias_Score']}) — {res['Trend_Strength']}")
+            for w in res.get("Warnings", []):
+                st.warning("⚠️ " + w)
 
             i1, i2, i3, i4, i5 = st.columns(5)
             i1.metric("Level", f"{res['Price']:,.2f}", f"{res['Day_Change_%']:+.2f}%")
@@ -171,6 +174,32 @@ with tab4:
                 pd.DataFrame(list(res["Levels"].items()), columns=["Level", "Value"]),
                 use_container_width=True, hide_index=True,
             )
+            hist = res.get("History")
+            st.markdown("### 📊 What happened historically in similar conditions")
+            if not hist:
+                st.info("Not enough price history to compute base rates for this index.")
+            else:
+                stt = hist["state"]
+                st.caption(
+                    f"Today's daily setup: bias **{stt['bucket']}** (score {stt['daily_score']:+d}/5), "
+                    f"RSI zone **{stt['rsi_zone']}**. Compared with {hist['years']} years of history "
+                    f"(since {hist['since']}), using daily factors only."
+                )
+                if hist["strength"] == "lean":
+                    st.success(hist["verdict"])
+                elif hist["strength"] in ("none", "unstable"):
+                    st.info(hist["verdict"])
+                else:
+                    st.warning(hist["verdict"])
+                hdf = pd.DataFrame(hist["table"])
+                st.dataframe(hdf, use_container_width=True, hide_index=True)
+                st.caption(
+                    "How to read this: '% Up' / '% Down' is how often the index closed higher / lower after that many trading days. "
+                    "Compare each row with 'All days (baseline)' — an index rises on more than half of all days, so a "
+                    "high '% Up' only matters if it beats the baseline. 'Episodes' counts separate occurrences "
+                    "(neighbouring days are one episode), which is the real sample size. Percentages are hidden when "
+                    "there are too few cases. Past base rates are not a promise of future results."
+                )
             st.caption("A read of current conditions from price data — not a forecast. Yahoo provides no volume for indices, so volume is not used.")
         else:
             c1, c2, c3, c4, c5 = st.columns(5)
