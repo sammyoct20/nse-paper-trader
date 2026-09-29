@@ -2,8 +2,16 @@ name: NSE paper scanner
 
 on:
   schedule:
+    # 03:45-10:00 UTC = 09:15-15:30 IST. The engine itself no-ops outside
+    # market hours and on listed NSE holidays, so extra edge runs are harmless.
     - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch:
+
+# Never let two runs overlap (a slow run + the next 5-min trigger could
+# otherwise open/close the same paper position twice).
+concurrency:
+  group: nse-paper-scanner
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -16,9 +24,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - run: pip install -r requirements.txt
 
       - run: python worker.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # Optional: comma-separated NSE trading holidays, e.g. "2026-10-02,2026-11-08"
+          NSE_HOLIDAYS: ${{ vars.NSE_HOLIDAYS }}
