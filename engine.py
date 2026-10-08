@@ -27,6 +27,7 @@ log = logging.getLogger("unified_engine")
 # against stale or thin after-hours data. This does NOT account for NSE
 # holidays; add a holiday-date check below if that matters for you.
 # -------------------------------------------------------------------
+ENGINE_VERSION = "2026.10.08-scanstats"  # bump on every release; app.py refuses to run an older engine
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN_TIME = dt_time(9, 15)
 MARKET_CLOSE_TIME = dt_time(15, 30)
@@ -753,6 +754,8 @@ ACCOUNT_STATE_COLUMNS = [
 # -------------------------------------------------------------------
 class PaperEngine:
     def __init__(self, initial_balance=100000.0, risk_per_trade_pct=1.0):
+        self.engine_version = ENGINE_VERSION
+        self.last_scan_stats = None  # filled by scan_all_strategies()
         self.risk_per_trade_pct = risk_per_trade_pct
         env_initial_balance = float(os.getenv("OPTIONS_CAPITAL", initial_balance))
 
