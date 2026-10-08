@@ -1700,6 +1700,7 @@ class PaperEngine:
         strike = atm_strike(spot, step=step)
 
         # ---- entry premium: Paytm (live) -> NSE chain (NIFTY) -> Black-Scholes model
+        premium_source = "Paytm Money (live)"
         entry_premium = self.paytm.get_option_ltp(index_symbol, expiry, strike, direction)
         if entry_premium is None and index_symbol == "NIFTY":
             try:
@@ -1708,10 +1709,12 @@ class PaperEngine:
                 contract = get_contract(chain, strike, expiry, direction)
                 if contract and contract.get("ltp"):
                     entry_premium = contract["ltp"]
+                    premium_source = "NSE option chain (live)"
             except Exception:
                 pass
         if entry_premium is None:
             entry_premium = self._estimate_option_premium(index_symbol, spot, strike, expiry, direction)
+            premium_source = "Model estimate (not a live quote)"
 
         if entry_premium is None:
             log.info(f"[OPTIONS] {index_symbol} setup found but no premium could be priced.")
@@ -1783,6 +1786,7 @@ class PaperEngine:
             "Total Capital Needed": round(entry_premium * lot_size * lots, 2) if lots else 0.0,
             "ADX": sig["adx"],
             "RSI": sig["rsi"],
+            "Premium Source": premium_source,
             "Blocked Reason": reason,
         }
 
