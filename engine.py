@@ -1491,13 +1491,19 @@ class PaperEngine:
             log.warning(f"Risk gate closed ({reason}) — scan will run but sized quantities will be 0.")
 
         swing_list, intraday_list, btst_list = [], [], []
+        # Diagnostics only (does not affect any filter): lets the UI tell "Yahoo
+        # returned nothing" apart from "data fine, no stock qualifies".
+        stats = {"total": len(tickers), "usable": 0, "liquid": 0, "above_200": 0,
+                 "above_20": 0, "failed_batches": 0, "batches": 0}
 
         batch_size = 50
         for i in range(0, len(tickers), batch_size):
             chunk = tickers[i:i + batch_size]
+            stats["batches"] += 1
             try:
                 data = yf.download(tickers=chunk, period="1y", interval="1d", group_by='ticker', threads=True, progress=False)
             except Exception:
+                stats["failed_batches"] += 1
                 continue
 
             for ticker in chunk:
@@ -1505,6 +1511,7 @@ class PaperEngine:
                     df = data[ticker].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
                     if len(df) < 50:
                         continue
+                    stats["usable"] += 1
 
                     close = df['Close'].squeeze()
                     high = df['High'].squeeze()
@@ -1528,6 +1535,9 @@ class PaperEngine:
 
                     if (curr_close * curr_vol_sma) < 5_000_000:
                         continue
+                    stats["liquid"] += 1
+                    stats["above_200"] += int(curr_close > curr_ema200)
+                    stats["above_20"] += int(curr_close > curr_ema20)
 
                     clean_symbol = ticker.replace(".NS", "")
                     vol_mult = round(curr_vol / curr_vol_sma, 2) if curr_vol_sma > 0 else 1.0
@@ -1598,6 +1608,10 @@ class PaperEngine:
 
                 except Exception:
                     continue
+
+        stats["scanned_at"] = datetime.now(IST).strftime("%d-%b %H:%M IST")
+        stats["matches"] = {"SWING": len(swing_list), "INTRADAY": len(intraday_list), "BTST": len(btst_list)}
+        self.last_scan_stats = stats
 
         return {
             "SWING": pd.DataFrame(swing_list).sort_values(by="Vol_Mult", ascending=False).head(top_n).reset_index(drop=True) if swing_list else pd.DataFrame(),
