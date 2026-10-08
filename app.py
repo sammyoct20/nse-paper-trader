@@ -43,14 +43,41 @@ if not hasattr(st.session_state.engine, "analyze_index"):
     st.error("Engine mismatch: " + _why)
     st.code(f"engine file: {_path}\nanalyze_index found at line(s): {[n for n, _ in _hits]}\n"
             f"indent of first match: {(len(_hits[0][1]) - len(_hits[0][1].lstrip())) if _hits else 'n/a'} spaces\n"
-            f"lines in file: {len(_lines)} (expected ~2037 for the new version)")
+            f"lines in file: {len(_lines)} (expected ~2051 for the new version)")
     st.stop()
 
-@st.cache_data(ttl=900)
+class ScanDataError(Exception):
+    pass
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_scan_results(index_name, top_n):
+    """Cached for 15 minutes — but a scan where Yahoo returned little or no
+    data raises instead, because Streamlit never caches exceptions. That stops
+    an empty, failed scan from being served again on every click."""
     engine = st.session_state.engine
     universe = engine.fetch_nse_universe(index_name)
-    return engine.scan_all_strategies(universe, top_n=top_n)
+    results = engine.scan_all_strategies(universe, top_n=top_n)
+    stats = engine.last_scan_stats
+    if stats["total"] and stats["usable"] < 0.5 * stats["total"]:
+        raise ScanDataError(
+            f"Yahoo Finance returned usable data for only {stats['usable']} of {stats['total']} stocks "
+            f"({stats['failed_batches']} of {stats['batches']} download batches failed). "
+            "This is a data-source problem, not 'no setups'. Wait a minute and scan again."
+        )
+    return results, stats
+
+def stock_scan_note(strategy_label):
+    """One-line context shown under an empty stock tab."""
+    stt = st.session_state.get("scan_stats")
+    if not stt:
+        return
+    liquid = max(stt["liquid"], 1)
+    st.caption(
+        f"Scanned {stt['usable']} of {stt['total']} stocks at {stt['scanned_at']} "
+        f"({stt['liquid']} liquid enough). {stt['above_200']} of them ({100 * stt['above_200'] / liquid:.0f}%) "
+        f"are above their 200-day EMA and {stt['above_20']} ({100 * stt['above_20'] / liquid:.0f}%) above their 20-day EMA. "
+        f"{strategy_label} setups are long-only, so a weak market gives few or none."
+    )
 
 st.sidebar.header("🛡️ Risk Management (Kotegawa Rules)")
 risk_status = st.session_state.engine.risk_status()
@@ -74,10 +101,18 @@ selected_index = st.sidebar.selectbox("Universe", ["NIFTY 50", "NIFTY NEXT 50", 
 max_results = st.sidebar.slider("Max Output Per Strategy", min_value=3, max_value=15, value=5)
 
 scan_disabled = risk_status["circuit_breaker_tripped"]
+force_fresh = st.sidebar.checkbox("Force fresh scan (skip 15-min cache)", value=False)
 if st.sidebar.button("🚀 Run Equity Market Scan", disabled=scan_disabled):
+    if force_fresh:
+        fetch_scan_results.clear()
     with st.spinner(f"Scanning {selected_index} for top {max_results} setups..."):
-        st.session_state["scan_results"] = fetch_scan_results(selected_index, max_results)
-    st.sidebar.success("Scan Complete!")
+        try:
+            _res, _stats = fetch_scan_results(selected_index, max_results)
+            st.session_state["scan_results"] = _res
+            st.session_state["scan_stats"] = _stats
+            st.sidebar.success(f"Scan complete — {_stats['usable']}/{_stats['total']} stocks analysed.")
+        except ScanDataError as _e:
+            st.sidebar.error(str(_e))
 if scan_disabled:
     st.sidebar.caption("Scanning is disabled while the circuit breaker is tripped. Setups can still exceed capital risk limits; wait for tomorrow's reset.")
 
@@ -93,6 +128,7 @@ with tab1:
             st.dataframe(df, use_container_width=True)
         else:
             st.info("No stocks matched strict Swing criteria.")
+            stock_scan_note("Swing")
     else:
         st.info("Click 'Run Equity Market Scan' to fetch setups.")
 
@@ -104,6 +140,7 @@ with tab2:
             st.dataframe(df, use_container_width=True)
         else:
             st.info("No stocks matched strict Intraday criteria.")
+            stock_scan_note("Intraday")
     else:
         st.info("Click 'Run Equity Market Scan' to fetch setups.")
 
@@ -115,6 +152,7 @@ with tab3:
             st.dataframe(df, use_container_width=True)
         else:
             st.info("No stocks matched strict BTST criteria.")
+            stock_scan_note("BTST")
     else:
         st.info("Click 'Run Equity Market Scan' to fetch setups.")
 
