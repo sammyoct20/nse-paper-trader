@@ -2,6 +2,7 @@ import io
 import os
 import time
 import math
+import threading
 import logging
 import warnings
 from datetime import datetime, date, timedelta, time as dt_time
@@ -342,25 +343,34 @@ def black_scholes_premium(spot: float, strike: float, t_years: float, vol: float
 # -------------------------------------------------------------------
 # INDEX OPTIONS — SIGNAL, EXPIRY-AWARE PARAMETERS, EXIT RULES
 # -------------------------------------------------------------------
-def signal_v2(df: pd.DataFrame, now_ist: datetime, breakout_n: int = 12,
-              adx_min: float = 20.0) -> dict | None:
-    """Stricter CE/PE trigger on 5m index candles. Fixes vs the original:
-      - uses only COMPLETED candles (the original read the still-forming bar)
-      - ADX filter to skip chop
-      - N-candle breakout instead of just the previous candle's high/low
-      - the 15m trend must agree with the 5m trend
-      - skips over-extended moves (price > 2.5 ATR from the 20 EMA)
-      - no entries in the first 15 minutes after the open
-    Returns None (no trade) or a dict with the direction and the readings."""
+def signal_diagnostics(df: pd.DataFrame, now_ist: datetime, breakout_n: int = 8,
+                       adx_min: float = 20.0, recent_candles: int = 2) -> dict:
+    """Evaluates every CE and PE entry condition on COMPLETED 5-minute candles
+    and returns the full checklist (so the UI can show WHY there is no call),
+    plus the resulting direction when all conditions of one side pass.
+
+    Conditions per side (CE shown; PE is the mirror image):
+      1. 5-min trend:   price > EMA20 > EMA50
+      2. Strength:      ADX >= adx_min (skips chop)
+      3. Momentum:      RSI 50-80   (PE: 20-50)
+      4. Breakout:      close above the prior `breakout_n`-candle high within
+                        the last `recent_candles` candles (so a call isn't missed
+                        just because you checked a few minutes after the break)
+      5. 15-min trend:  not clearly AGAINST the trade (soft filter)
+      6. Not stretched: price within 3 ATR of the 20 EMA
+      7. Timing:        after 09:30 IST (the first 15 minutes are noise)"""
+    out = {"status": None, "direction": None, "CE": [], "PE": [], "values": {}}
     if df is None or df.empty:
-        return None
+        out["status"] = "No 5-minute data came back from Yahoo Finance — try again in a minute."
+        return out
     df = df.copy()
     if df.index.tz is None:
         df.index = df.index.tz_localize(IST)
     if df.index[-1] + timedelta(minutes=5) > now_ist:
-        df = df.iloc[:-1]  # drop the forming candle
-    if len(df) < 60 or now_ist.time() < dt_time(9, 30):
-        return None
+        df = df.iloc[:-1]  # drop the still-forming candle
+    if len(df) < 60:
+        out["status"] = f"Only {len(df)} five-minute candles available (60 needed for the indicators)."
+        return out
 
     c, h, l = df["Close"], df["High"], df["Low"]
     ema_f = c.ewm(span=20, min_periods=20).mean()
@@ -371,32 +381,67 @@ def signal_v2(df: pd.DataFrame, now_ist: datetime, breakout_n: int = 12,
     hh = h.rolling(breakout_n).max().shift(1)
     ll = l.rolling(breakout_n).min().shift(1)
 
-    # 15m trend filter (last 15m bar may be incomplete, so drop it)
+    # 15m trend (last 15m bar may be incomplete, so drop it)
     c15 = c.resample("15min").last().dropna().iloc[:-1]
     e15f = c15.ewm(span=20, min_periods=20).mean()
     e15s = c15.ewm(span=50, min_periods=50).mean()
     if len(c15) < 50 or pd.isna(e15s.iloc[-1]):
-        htf_up = htf_dn = True  # not enough data — don't block on it
+        htf_up = htf_dn = False
+        htf_txt = "15-min trend not available (not enough data) — not blocking"
     else:
         htf_up = bool(c15.iloc[-1] > e15f.iloc[-1] > e15s.iloc[-1])
         htf_dn = bool(c15.iloc[-1] < e15f.iloc[-1] < e15s.iloc[-1])
+        htf_txt = "15-min trend: " + ("UP" if htf_up else ("DOWN" if htf_dn else "mixed"))
 
     px, ef, es = float(c.iloc[-1]), float(ema_f.iloc[-1]), float(ema_s.iloc[-1])
     r, a, at = float(rsi.iloc[-1]), float(adx.iloc[-1]), float(atr.iloc[-1])
-    if any(pd.isna(x) for x in (px, ef, es, r, a, at)) or a < adx_min:
-        return None
-    stretched = abs(px - ef) > 2.5 * at
-    hi_break, lo_break = float(hh.iloc[-1]), float(ll.iloc[-1])
+    if any(pd.isna(x) for x in (px, ef, es, r, a, at)):
+        out["status"] = "Indicators are still warming up (not enough clean candles)."
+        return out
 
-    direction = None
-    if px > ef > es and 52 < r < 72 and px > hi_break and htf_up and not stretched:
-        direction = "CE"
-    elif px < ef < es and 28 < r < 48 and px < lo_break and htf_dn and not stretched:
-        direction = "PE"
-    if not direction:
+    stretch = abs(px - ef) / at if at > 0 else 0.0
+    brk_up = bool((c.iloc[-recent_candles:] > hh.iloc[-recent_candles:]).any())
+    brk_dn = bool((c.iloc[-recent_candles:] < ll.iloc[-recent_candles:]).any())
+    hi_lvl, lo_lvl = float(hh.iloc[-1]), float(ll.iloc[-1])
+    time_ok = now_ist.time() >= dt_time(9, 30)
+
+    out["values"] = {"price": px, "ema20": ef, "ema50": es, "rsi": r, "adx": a, "atr": at,
+                     "last_candle": str(df.index[-1].strftime("%H:%M")), "htf": htf_txt}
+    out["CE"] = [
+        ("5-min trend up: price > EMA20 > EMA50", px > ef > es, f"price {px:,.0f} | EMA20 {ef:,.0f} | EMA50 {es:,.0f}"),
+        (f"Trend strength: ADX at least {adx_min:.0f}", a >= adx_min, f"ADX {a:.1f}"),
+        ("Momentum: RSI between 50 and 80", 50 < r < 80, f"RSI {r:.1f}"),
+        (f"Breakout above the prior {breakout_n}-candle high (last {recent_candles} candles)", brk_up, f"breakout level {hi_lvl:,.0f}"),
+        ("15-min trend not against the trade", not htf_dn, htf_txt),
+        ("Not over-extended (within 3 ATR of EMA20)", stretch <= 3.0, f"{stretch:.1f} ATR from EMA20"),
+        ("After 09:30 IST", time_ok, now_ist.strftime("%H:%M")),
+    ]
+    out["PE"] = [
+        ("5-min trend down: price < EMA20 < EMA50", px < ef < es, f"price {px:,.0f} | EMA20 {ef:,.0f} | EMA50 {es:,.0f}"),
+        (f"Trend strength: ADX at least {adx_min:.0f}", a >= adx_min, f"ADX {a:.1f}"),
+        ("Momentum: RSI between 20 and 50", 20 < r < 50, f"RSI {r:.1f}"),
+        (f"Breakdown below the prior {breakout_n}-candle low (last {recent_candles} candles)", brk_dn, f"breakdown level {lo_lvl:,.0f}"),
+        ("15-min trend not against the trade", not htf_up, htf_txt),
+        ("Not over-extended (within 3 ATR of EMA20)", stretch <= 3.0, f"{stretch:.1f} ATR from EMA20"),
+        ("After 09:30 IST", time_ok, now_ist.strftime("%H:%M")),
+    ]
+    if all(p for _, p, _ in out["CE"]):
+        out["direction"] = "CE"
+    elif all(p for _, p, _ in out["PE"]):
+        out["direction"] = "PE"
+    return out
+
+
+def signal_v2(df: pd.DataFrame, now_ist: datetime, breakout_n: int = 8,
+              adx_min: float = 20.0, recent_candles: int = 2) -> dict | None:
+    """CE/PE trigger on 5m index candles — see signal_diagnostics() for the
+    conditions. Returns None (no trade) or a dict with the direction/readings."""
+    diag = signal_diagnostics(df, now_ist, breakout_n=breakout_n, adx_min=adx_min, recent_candles=recent_candles)
+    if not diag["direction"]:
         return None
-    return {"direction": direction, "price": px, "adx": round(a, 1),
-            "rsi": round(r, 1), "atr": round(at, 2)}
+    v = diag["values"]
+    return {"direction": diag["direction"], "price": v["price"], "adx": round(v["adx"], 1),
+            "rsi": round(v["rsi"], 1), "atr": round(v["atr"], 2)}
 
 
 def option_params(now_ist: datetime, expiry_str: str) -> dict:
@@ -410,7 +455,7 @@ def option_params(now_ist: datetime, expiry_str: str) -> dict:
         is_expiry_day = False
     if is_expiry_day:
         return dict(expiry_day=True, sl_pct=0.30, tgt_pct=0.50, risk_scale=0.5,
-                    last_entry=dt_time(13, 30), adx_min=25.0, min_premium=15.0)
+                    last_entry=dt_time(13, 30), adx_min=24.0, min_premium=15.0)
     return dict(expiry_day=False,
                 sl_pct=float(os.getenv("OPTIONS_STOP_LOSS_PCT", 0.25)),
                 tgt_pct=float(os.getenv("OPTIONS_TARGET_PCT", 0.40)),
@@ -456,6 +501,67 @@ INDEX_ALIASES = {
     "BANKNIFTY": "BANKNIFTY", "^NSEBANK": "BANKNIFTY",
 }
 ANALYZER_INDEX_TICKERS = {"NIFTY": "^NSEI", "SENSEX": "^BSESN", "BANKNIFTY": "^NSEBANK"}
+
+# ---- 15-year daily history cache (index analyzer) ---------------------------
+# The long history barely changes intraday, so it's cached process-wide for an
+# hour (shared across browser sessions). The live 5-minute data is NOT cached,
+# and today's daily bar is rebuilt from it on every call (merge_live_bar).
+_DAILY_CACHE: dict = {}
+_DAILY_CACHE_LOCK = threading.Lock()
+DAILY_CACHE_TTL_SECONDS = int(os.getenv("DAILY_HISTORY_CACHE_SECONDS", 3600))
+
+def get_daily_history(yf_symbol: str, period: str = "15y") -> pd.DataFrame:
+    """Daily candles, cached for DAILY_CACHE_TTL_SECONDS. If a refresh fails
+    (Yahoo rate-limits cloud hosts now and then) a stale cached copy is used
+    instead of failing outright."""
+    now = time.time()
+    with _DAILY_CACHE_LOCK:
+        hit = _DAILY_CACHE.get(yf_symbol)
+    if hit and (now - hit[1]) < DAILY_CACHE_TTL_SECONDS:
+        return hit[0].copy()
+    try:
+        df = yf.Ticker(yf_symbol).history(period=period, interval="1d")
+        if df is not None and not df.empty:
+            with _DAILY_CACHE_LOCK:
+                _DAILY_CACHE[yf_symbol] = (df, now)
+            return df.copy()
+    except Exception as e:
+        log.warning(f"Daily history refresh failed for {yf_symbol}: {e}")
+    if hit:
+        log.warning(f"Using STALE cached daily history for {yf_symbol} ({int((now - hit[1]) / 60)} min old).")
+        return hit[0].copy()
+    return pd.DataFrame()
+
+def daily_cache_age_minutes(yf_symbol: str) -> float | None:
+    with _DAILY_CACHE_LOCK:
+        hit = _DAILY_CACHE.get(yf_symbol)
+    return round((time.time() - hit[1]) / 60, 1) if hit else None
+
+def merge_live_bar(d: pd.DataFrame, m: pd.DataFrame) -> pd.DataFrame:
+    """Overwrite (or append) the latest daily bar from the live 5-minute
+    candles, so cached history never makes today's price/High/Low stale."""
+    if d.empty or m.empty:
+        return d
+    session = m.index[-1].date()
+    today = m[m.index.date == session]
+    if today.empty:
+        return d
+    row = {"Open": float(today["Open"].iloc[0]), "High": float(today["High"].max()),
+           "Low": float(today["Low"].min()), "Close": float(today["Close"].iloc[-1]), "Volume": 0}
+    d = d.copy()
+    last_date = d.index[-1].date()
+    if last_date > session:
+        return d
+    if last_date == session:
+        for k, v in row.items():
+            if k in d.columns:
+                d.loc[d.index[-1], k] = v
+        return d
+    ts = pd.Timestamp(session)
+    if d.index.tz is not None:
+        ts = ts.tz_localize(d.index.tz)
+    new = pd.DataFrame([row], index=[ts]).reindex(columns=d.columns).fillna(0.0)
+    return pd.concat([d, new])
 
 
 def historical_edge(d: pd.DataFrame, name: str, horizons=(1, 3, 5),
@@ -1513,6 +1619,43 @@ class PaperEngine:
         self.open_stock_trade(ticker, strategy, entry, sl, tgt, qty, risk_amount, position_value)
         return True
 
+    def explain_index_options(self, index_symbol="NIFTY") -> dict:
+        """Why is there (or isn't there) a CE/PE call right now? Returns the
+        full condition checklist for both sides so the dashboard can show
+        exactly which filter is blocking, instead of a bare 'no setup'."""
+        now_ist = datetime.now(IST)
+        info = {"index": index_symbol, "time": now_ist.strftime("%a %d-%b %H:%M IST"),
+                "market_open": is_market_open(now_ist), "status": None}
+        if index_symbol not in VALID_INDEX_SYMBOLS:
+            info["status"] = f"{index_symbol} is not a supported index."
+            return info
+        weekday = 1 if index_symbol == "NIFTY" else 3
+        expiry = nearest_expiry_date(target_weekday=weekday, now=now_ist)
+        params = option_params(now_ist, expiry)
+        info.update({"expiry": expiry, "expiry_day": params["expiry_day"],
+                     "entry_cutoff": params["last_entry"].strftime("%H:%M"),
+                     "past_cutoff": now_ist.time() > params["last_entry"]})
+        if not info["market_open"]:
+            info["status"] = ("The NSE market is closed right now (Mon–Fri 09:15–15:30 IST, excluding "
+                              "holidays), so there are no live calls.")
+            return info
+        try:
+            df = yf.Ticker(INDEX_YF_TICKERS.get(index_symbol, "^NSEI")).history(period="5d", interval="5m")
+        except Exception as e:
+            info["status"] = f"Could not fetch 5-minute data: {e}"
+            return info
+        diag = signal_diagnostics(df, now_ist, adx_min=params["adx_min"])
+        info.update(diag)
+        if diag["status"] is None:
+            ce_n = sum(1 for _, p, _ in diag["CE"] if p)
+            pe_n = sum(1 for _, p, _ in diag["PE"] if p)
+            side = "CE" if ce_n >= pe_n else "PE"
+            info["closest"] = side
+            info["closest_met"] = max(ce_n, pe_n)
+            info["closest_total"] = len(diag[side])
+            info["missing"] = [lbl for lbl, p, _ in diag[side] if not p]
+        return info
+
     def evaluate_index_options(self, index_symbol="NIFTY", paper_trade=False):
         if index_symbol not in VALID_INDEX_SYMBOLS:
             return None
@@ -1538,10 +1681,11 @@ class PaperEngine:
             step = 100.0
         params = option_params(now_ist, expiry)
 
+        late_reason = None
         if now_ist.time() > params["last_entry"]:
-            log.info(f"[OPTIONS] {index_symbol}: past the {params['last_entry'].strftime('%H:%M')} entry cutoff"
-                     f"{' (expiry day)' if params['expiry_day'] else ''} — no new entries.")
-            return None
+            late_reason = (f"past the {params['last_entry'].strftime('%H:%M')} entry cutoff"
+                           f"{' (expiry day)' if params['expiry_day'] else ''} — no new entries")
+            log.info(f"[OPTIONS] {index_symbol}: {late_reason}.")
 
         yf_symbol = INDEX_YF_TICKERS.get(index_symbol, "^NSEI")
         df = yf.Ticker(yf_symbol).history(period="5d", interval="5m")
@@ -1569,10 +1713,14 @@ class PaperEngine:
         if entry_premium is None:
             entry_premium = self._estimate_option_premium(index_symbol, spot, strike, expiry, direction)
 
-        if entry_premium is None or entry_premium < params["min_premium"]:
-            log.info(f"[OPTIONS] {index_symbol} setup skipped: premium {entry_premium} below "
-                     f"minimum {params['min_premium']} (lottery-ticket zone).")
+        if entry_premium is None:
+            log.info(f"[OPTIONS] {index_symbol} setup found but no premium could be priced.")
             return None
+        low_premium_reason = None
+        if entry_premium < params["min_premium"]:
+            low_premium_reason = (f"premium ₹{entry_premium:.2f} is below the ₹{params['min_premium']:.0f} "
+                                  f"minimum (lottery-ticket zone)")
+            log.info(f"[OPTIONS] {index_symbol}: {low_premium_reason}.")
 
         contract_name = f"{index_symbol} {int(strike)} {direction} {expiry}"
         sl_premium = round(entry_premium * (1 - params["sl_pct"]), 2)
@@ -1601,6 +1749,12 @@ class PaperEngine:
         if not status["new_entries_allowed"]:
             reason = ("daily loss circuit breaker tripped" if status["circuit_breaker_tripped"]
                        else "max open positions reached")
+            lots = 0
+        elif late_reason:
+            reason = late_reason
+            lots = 0
+        elif low_premium_reason:
+            reason = low_premium_reason
             lots = 0
         elif guard_reason:
             reason = guard_reason
@@ -1647,8 +1801,9 @@ class PaperEngine:
         Keeps every key analyze_stock() returns so the UI doesn't break."""
         yf_symbol = ANALYZER_INDEX_TICKERS[name]
         try:
-            d = yf.Ticker(yf_symbol).history(period="15y", interval="1d")  # long history for base rates
-            m = yf.Ticker(yf_symbol).history(period="5d", interval="5m")
+            d = get_daily_history(yf_symbol)                       # 15y, cached ~1h
+            m = yf.Ticker(yf_symbol).history(period="5d", interval="5m")   # always live
+            d = merge_live_bar(d, m)                               # today's bar from live data
         except Exception as e:
             return {"Error": f"Could not fetch {name} data: {e}"}
         if d.empty or m.empty or len(d) < 60:
@@ -1735,6 +1890,7 @@ class PaperEngine:
             "Trend_Strength": strength,
             "Day_Change_%": round(day_chg, 2),
             "Session": str(session),
+            "History_Cache_Age_Min": daily_cache_age_minutes(yf_symbol),
             "Score": f"{total:+d}/{len(factors)}",
             "RSI": round(c_rsi, 1),
             "ATR": round(c_atr, 2),
