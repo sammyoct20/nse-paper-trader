@@ -4,22 +4,24 @@ import streamlit as st
 import pandas as pd
 import engine as engine_module
 
-# Streamlit keeps imported modules cached in the running server, so a redeploy
-# or file change can leave an OLD engine module in memory. If the class is
-# missing the index analyzer, force-reload the module from disk once.
-if not hasattr(engine_module.PaperEngine, "analyze_index"):
-    engine_module = importlib.reload(engine_module)
+# Must match ENGINE_VERSION in engine.py. Streamlit keeps imported modules (and
+# objects in session_state) in memory across redeploys, so an OLD engine can
+# survive next to a NEW app.py. A version check catches every such mismatch.
+REQUIRED_ENGINE_VERSION = "2026.10.08-scanstats"
+
+if getattr(engine_module, "ENGINE_VERSION", None) != REQUIRED_ENGINE_VERSION:
+    engine_module = importlib.reload(engine_module)  # pick up the file on disk
 PaperEngine = engine_module.PaperEngine
 
 st.set_page_config(page_title="NSE Stock & Index Options Scanner Engine", layout="wide")
 st.title("⚡ Sammy - Multi-Asset Trading Engine")
 
-# Rebuild the cached engine if this browser session is holding an object from an
-# older deploy (session_state survives code updates until the server restarts).
-if "engine" not in st.session_state or not hasattr(st.session_state.engine, "analyze_index"):
+# Rebuild the cached engine object if this session holds one from an older deploy.
+if ("engine" not in st.session_state
+        or getattr(st.session_state.engine, "engine_version", None) != REQUIRED_ENGINE_VERSION):
     st.session_state.engine = PaperEngine()
 
-if not hasattr(st.session_state.engine, "analyze_index"):
+if getattr(st.session_state.engine, "engine_version", None) != REQUIRED_ENGINE_VERSION:
     _path = inspect.getsourcefile(engine_module) or "unknown"
     _lines = []
     try:
@@ -27,23 +29,19 @@ if not hasattr(st.session_state.engine, "analyze_index"):
             _lines = _f.read().splitlines()
     except Exception:
         pass
-    _hits = [(i + 1, l) for i, l in enumerate(_lines) if "def analyze_index" in l]
-    if not _hits:
-        _why = ("The engine.py this server is running does NOT contain `def analyze_index`. "
-                "The server is running a different / older copy — check the file path below "
-                "and that the app is deployed from the branch you pushed to, then reboot.")
+    _ver_lines = [l.strip() for l in _lines if l.startswith("ENGINE_VERSION")]
+    if not _ver_lines:
+        _why = ("The engine.py on this server has no ENGINE_VERSION, so it is an OLD copy. "
+                "Upload the new engine.py to GitHub (same branch the app deploys from), then reboot the app.")
     else:
-        _indent = len(_hits[0][1]) - len(_hits[0][1].lstrip())
-        if _indent == 0 or hasattr(engine_module, "analyze_index"):
-            _why = ("`def analyze_index` is in engine.py but NOT indented inside `class PaperEngine` "
-                    "(it must be indented 4 spaces, at the same level as `def analyze_stock`).")
-        else:
-            _why = ("`def analyze_index` is in the file but the class doesn't expose it — "
-                    "reboot the app so the server reloads engine.py.")
+        _why = ("engine.py on disk is not the version this app.py needs. Upload the matching "
+                "engine.py, then reboot the app.")
     st.error("Engine mismatch: " + _why)
-    st.code(f"engine file: {_path}\nanalyze_index found at line(s): {[n for n, _ in _hits]}\n"
-            f"indent of first match: {(len(_hits[0][1]) - len(_hits[0][1].lstrip())) if _hits else 'n/a'} spaces\n"
-            f"lines in file: {len(_lines)} (expected ~2051 for the new version)")
+    st.code(f"app.py needs:       {REQUIRED_ENGINE_VERSION}\n"
+            f"engine file:        {_path}\n"
+            f"version in file:    {_ver_lines[0] if _ver_lines else 'none (old file)'}\n"
+            f"version in memory:  {getattr(engine_module, 'ENGINE_VERSION', 'none')}\n"
+            f"lines in file:      {len(_lines)}")
     st.stop()
 
 class ScanDataError(Exception):
@@ -57,8 +55,8 @@ def fetch_scan_results(index_name, top_n):
     engine = st.session_state.engine
     universe = engine.fetch_nse_universe(index_name)
     results = engine.scan_all_strategies(universe, top_n=top_n)
-    stats = engine.last_scan_stats
-    if stats["total"] and stats["usable"] < 0.5 * stats["total"]:
+    stats = getattr(engine, "last_scan_stats", None)
+    if stats and stats["total"] and stats["usable"] < 0.5 * stats["total"]:
         raise ScanDataError(
             f"Yahoo Finance returned usable data for only {stats['usable']} of {stats['total']} stocks "
             f"({stats['failed_batches']} of {stats['batches']} download batches failed). "
@@ -110,7 +108,9 @@ if st.sidebar.button("🚀 Run Equity Market Scan", disabled=scan_disabled):
             _res, _stats = fetch_scan_results(selected_index, max_results)
             st.session_state["scan_results"] = _res
             st.session_state["scan_stats"] = _stats
-            st.sidebar.success(f"Scan complete — {_stats['usable']}/{_stats['total']} stocks analysed.")
+            st.sidebar.success(
+                f"Scan complete — {_stats['usable']}/{_stats['total']} stocks analysed." if _stats else "Scan complete."
+            )
         except ScanDataError as _e:
             st.sidebar.error(str(_e))
 if scan_disabled:
