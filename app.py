@@ -43,7 +43,7 @@ if not hasattr(st.session_state.engine, "analyze_index"):
     st.error("Engine mismatch: " + _why)
     st.code(f"engine file: {_path}\nanalyze_index found at line(s): {[n for n, _ in _hits]}\n"
             f"indent of first match: {(len(_hits[0][1]) - len(_hits[0][1].lstrip())) if _hits else 'n/a'} spaces\n"
-            f"lines in file: {len(_lines)} (expected ~1877 for the new version)")
+            f"lines in file: {len(_lines)} (expected ~2033 for the new version)")
     st.stop()
 
 @st.cache_data(ttl=900)
@@ -158,7 +158,12 @@ with tab4:
             i3.metric("ADX (14, daily)", res["ADX"])
             i4.metric("ATR (14, daily)", res["ATR"])
             i5.metric("200-day EMA", f"{res['EMA200']:,.2f}")
-            st.caption(f"Session analysed: {res['Session']} (latest available 5-min data; may lag the live tape).")
+            _age = res.get("History_Cache_Age_Min")
+            st.caption(
+                f"Session analysed: {res['Session']} (latest available 5-min data; may lag the live tape). "
+                f"15-year daily history cached {('%.0f' % _age) if _age is not None else '0'} min ago (refreshes hourly); "
+                "today's bar and the 5-minute data are fetched live on every click."
+            )
 
             st.markdown("### Trend Factors")
             for item in res["Checklist"]:
@@ -227,7 +232,7 @@ with tab5:
     st.subheader("NIFTY (Tuesday Expiry) & SENSEX (Thursday Expiry) Signals")
     col1, col2 = st.columns(2)
     with col1:
-        st.caption("Strategy: 5-Min Trend + 12-candle Breakout + ADX/15m filters (CE/PE). Expiry day: entries stop 13:30, half size.")
+        st.caption("Strategy: 5-Min Trend + 8-candle Breakout + ADX/15m filters (CE/PE). Expiry day: entries stop 13:30, half size.")
     with col2:
         st.caption("Lot Sizes: NIFTY = 65 | SENSEX = 20")
 
@@ -242,7 +247,34 @@ with tab5:
                     st.success(f"Trade Execution Contract: {signal['Contract Symbol']}")
                 st.json(signal)
             else:
-                st.warning(f"No CE/PE setup for {idx_select} right now (no qualifying breakout, or outside the entry window).")
+                st.warning(f"No CE/PE call for {idx_select} right now.")
+                info = st.session_state.engine.explain_index_options(idx_select)
+                if info.get("status"):
+                    st.info(info["status"])
+                else:
+                    st.caption(
+                        f"Checked at {info['time']} on the last completed 5-min candle ({info['values']['last_candle']}). "
+                        f"Next expiry: {info['expiry']}{' — TODAY (expiry-day rules apply)' if info['expiry_day'] else ''}. "
+                        f"New entries stop at {info['entry_cutoff']}."
+                    )
+                    if info.get("past_cutoff"):
+                        st.info(f"It's past today's {info['entry_cutoff']} entry cutoff, so new trades are blocked even if a setup appears.")
+                    st.markdown(
+                        f"**Closest to triggering: {info['closest']}** — {info['closest_met']} of "
+                        f"{info['closest_total']} conditions met."
+                    )
+                    if info["missing"]:
+                        st.error("Blocking it: " + "; ".join(info["missing"]))
+                    for side in ("CE", "PE"):
+                        met = sum(1 for _, p, _ in info[side] if p)
+                        with st.expander(f"{side} conditions — {met}/{len(info[side])} met", expanded=(side == info["closest"])):
+                            for label, passed, detail in info[side]:
+                                line = f"{'✅' if passed else '❌'} {label}" + (f"  \n   ↳ {detail}" if detail else "")
+                                (st.success if passed else st.error)(line)
+                    st.caption(
+                        "A call appears only when ALL conditions on one side are met at once. "
+                        "In strong one-way markets the opposite side's filters (e.g. a CE during a selloff) will correctly stay blocked."
+                    )
 
 with tab6:
     st.subheader("Paper Trading Account")
