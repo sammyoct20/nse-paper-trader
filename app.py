@@ -43,7 +43,7 @@ if not hasattr(st.session_state.engine, "analyze_index"):
     st.error("Engine mismatch: " + _why)
     st.code(f"engine file: {_path}\nanalyze_index found at line(s): {[n for n, _ in _hits]}\n"
             f"indent of first match: {(len(_hits[0][1]) - len(_hits[0][1].lstrip())) if _hits else 'n/a'} spaces\n"
-            f"lines in file: {len(_lines)} (expected ~2033 for the new version)")
+            f"lines in file: {len(_lines)} (expected ~2037 for the new version)")
     st.stop()
 
 @st.cache_data(ttl=900)
@@ -229,52 +229,59 @@ with tab4:
                     st.error(item)
 
 with tab5:
-    st.subheader("NIFTY (Tuesday Expiry) & SENSEX (Thursday Expiry) Signals")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.caption("Strategy: 5-Min Trend + 8-candle Breakout + ADX/15m filters (CE/PE). Expiry day: entries stop 13:30, half size.")
-    with col2:
-        st.caption("Lot Sizes: NIFTY = 65 | SENSEX = 20")
+    st.subheader("Index Options — CE / PE Calls")
+    st.caption(
+        "Scans NIFTY (Tuesday expiry) and SENSEX (Thursday expiry) on 5-minute charts. "
+        "If a call exists you get the strike, stop loss and target; otherwise it says so."
+    )
 
-    idx_select = st.selectbox("Select Index:", ["NIFTY", "SENSEX"])
-    if st.button(f"⚡ Scan Live {idx_select} Options Signal"):
-        with st.spinner(f"Evaluating 5m charts for {idx_select}..."):
-            signal = st.session_state.engine.evaluate_index_options(idx_select)
-            if signal:
-                if signal.get("Blocked Reason"):
-                    st.warning(f"Setup found but blocked: {signal['Blocked Reason']}")
+    if st.button("⚡ Scan CE/PE Calls"):
+        calls = []
+        with st.spinner("Scanning NIFTY and SENSEX..."):
+            for _idx in ("NIFTY", "SENSEX"):
+                try:
+                    _sig = st.session_state.engine.evaluate_index_options(_idx)
+                except Exception as _e:
+                    _sig = None
+                    st.error(f"Could not scan {_idx}: {_e}")
+                if _sig:
+                    calls.append(_sig)
+
+        if not calls:
+            st.info("No CE/PE calls as of now.")
+            if not engine_module.is_market_open():
+                st.caption("The NSE market is closed (Mon–Fri 09:15–15:30 IST), so there are no live calls.")
+        else:
+            for _sig in calls:
+                _is_ce = _sig["Direction"] == "CE"
+                _head = (f"{'🟢' if _is_ce else '🔴'} {_sig['Index']}: BUY {_sig['Direction']} "
+                         f"({'bullish' if _is_ce else 'bearish'}) — {_sig['Contract Symbol']}")
+                if _sig.get("Blocked Reason"):
+                    st.warning(_head)
+                    st.caption(f"Setup found, but not tradable right now: {_sig['Blocked Reason']}.")
                 else:
-                    st.success(f"Trade Execution Contract: {signal['Contract Symbol']}")
-                st.json(signal)
-            else:
-                st.warning(f"No CE/PE call for {idx_select} right now.")
-                info = st.session_state.engine.explain_index_options(idx_select)
-                if info.get("status"):
-                    st.info(info["status"])
+                    st.success(_head)
+
+                _risk = _sig["Premium (LTP)"] - _sig["Stop Loss"]
+                _rr = (_sig["Target"] - _sig["Premium (LTP)"]) / _risk if _risk > 0 else 0
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Strike", f"{int(_sig['Strike'])} {_sig['Direction']}")
+                m2.metric("Entry (premium)", f"₹{_sig['Premium (LTP)']}")
+                m3.metric("Stop Loss", f"₹{_sig['Stop Loss']}")
+                m4.metric("Target", f"₹{_sig['Target']}")
+
+                _lots = _sig["Recommended Lots"]
+                st.caption(
+                    f"Expiry {_sig['Expiry']}{' (TODAY — expiry-day rules)' if _sig.get('Expiry Day') else ''} | "
+                    f"Spot {_sig['Spot Price']:,.2f} | Lot size {_sig['Lot Size']} | Reward:Risk {_rr:.1f}:1"
+                    + (f" | Suggested size {_lots} lot(s), risking ≈ ₹{_sig['Risk Amount']:,.0f}" if _lots else "")
+                )
+                _src = _sig.get("Premium Source", "")
+                if _src.startswith("Model"):
+                    st.caption("⚠️ Premium is a model estimate, not a live quote. Check the real option price before using these levels — scale stop loss and target from the actual premium (SL -25%, target +40%; expiry day -30% / +50%).")
                 else:
-                    st.caption(
-                        f"Checked at {info['time']} on the last completed 5-min candle ({info['values']['last_candle']}). "
-                        f"Next expiry: {info['expiry']}{' — TODAY (expiry-day rules apply)' if info['expiry_day'] else ''}. "
-                        f"New entries stop at {info['entry_cutoff']}."
-                    )
-                    if info.get("past_cutoff"):
-                        st.info(f"It's past today's {info['entry_cutoff']} entry cutoff, so new trades are blocked even if a setup appears.")
-                    st.markdown(
-                        f"**Closest to triggering: {info['closest']}** — {info['closest_met']} of "
-                        f"{info['closest_total']} conditions met."
-                    )
-                    if info["missing"]:
-                        st.error("Blocking it: " + "; ".join(info["missing"]))
-                    for side in ("CE", "PE"):
-                        met = sum(1 for _, p, _ in info[side] if p)
-                        with st.expander(f"{side} conditions — {met}/{len(info[side])} met", expanded=(side == info["closest"])):
-                            for label, passed, detail in info[side]:
-                                line = f"{'✅' if passed else '❌'} {label}" + (f"  \n   ↳ {detail}" if detail else "")
-                                (st.success if passed else st.error)(line)
-                    st.caption(
-                        "A call appears only when ALL conditions on one side are met at once. "
-                        "In strong one-way markets the opposite side's filters (e.g. a CE during a selloff) will correctly stay blocked."
-                    )
+                    st.caption(f"Premium source: {_src}.")
+            st.caption("Educational paper-trading signals, not financial advice.")
 
 with tab6:
     st.subheader("Paper Trading Account")
